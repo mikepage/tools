@@ -2,6 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "tools",
   "main": "src/worker.ts",
+  "minify": true,
   "compatibility_date": "2026-09-30",
   // No compatibility flags: web standards and Effect only, no nodejs_compat.
   "compatibility_flags": [],
