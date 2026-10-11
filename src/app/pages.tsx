@@ -18,14 +18,14 @@ export const Home = (props: { readonly tools: ReadonlyArray<AnyTool> }): Html =>
       const list = props.tools.filter((t) => t.category === category)
       return list.length === 0 ? null : [
         <h2>{category}</h2>,
-        <div class="grid">
+        <ul class="index">
           {list.map((t) => (
-            <a href={`/${t.slug}`}>
-              <strong>{t.title}</strong>
+            <li>
+              <a href={`/${t.slug}`}>{t.title}</a>
               <span>{t.summary}</span>
-            </a>
+            </li>
           ))}
-        </div>,
+        </ul>,
       ]
     })}
   </Layout>
