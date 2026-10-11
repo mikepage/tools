@@ -1,28 +1,28 @@
 // IPv6 utils: expand and compress an address, work out its network for a
 // prefix length, and check it against a CIDR range. Pure 128-bit BigInt math.
 
-import { Effect, Option, Result as R, Schema, SchemaTransformation } from "effect"
 import { Field, KeyValue, Status, Summary } from "../app/ui.tsx"
+import { integer, optional } from "../lib/params.ts"
 import * as Tool from "./Tool.ts"
 
 // --- Pure helpers ---------------------------------------------------------------
 
-/** Eight zero-padded lowercase groups, or None when the input is not IPv6. */
-export const expandIpv6 = (input: string): Option.Option<string> => {
+/** Eight zero-padded lowercase groups, or undefined when the input is not IPv6. */
+export const expandIpv6 = (input: string): string | undefined => {
   const parts = input.trim().split("::")
-  if (parts.length > 2) return Option.none()
+  if (parts.length > 2) return undefined
   let groups: Array<string>
   if (parts.length === 2) {
     const left = parts[0] ? parts[0].split(":") : []
     const right = parts[1] ? parts[1].split(":") : []
     const missing = 8 - left.length - right.length
-    if (missing < 1) return Option.none()
+    if (missing < 1) return undefined
     groups = [...left, ...Array<string>(missing).fill("0"), ...right]
   } else {
     groups = parts[0]!.split(":")
   }
-  if (groups.length !== 8 || !groups.every((g) => /^[0-9a-f]{1,4}$/i.test(g))) return Option.none()
-  return Option.some(groups.map((g) => g.padStart(4, "0").toLowerCase()).join(":"))
+  if (groups.length !== 8 || !groups.every((g) => /^[0-9a-f]{1,4}$/i.test(g))) return undefined
+  return groups.map((g) => g.padStart(4, "0").toLowerCase()).join(":")
 }
 
 /** RFC 5952: strip leading zeros, collapse the longest run (two or more) of zero groups to `::`. */
@@ -76,7 +76,7 @@ export const kindOf = (full: string): string => {
   for (const [cidr, kind] of KINDS) {
     const [range = "", bits = "0"] = cidr.split("/")
     const prefix = Number(bits)
-    if (networkOf(fromBigInt(value), prefix) === networkOf(Option.getOrThrow(expandIpv6(range)), prefix)) return kind
+    if (networkOf(fromBigInt(value), prefix) === networkOf(expandIpv6(range)!, prefix)) return kind
   }
   return "Reserved"
 }
@@ -110,61 +110,40 @@ export const describeIpv6 = (full: string, prefix: number): Details => {
   }
 }
 
-/** Is `full` inside `cidr` (e.g. 2001:db8::/32)? A bad range is a failure with a message. */
-export const inCidr = (full: string, cidr: string): R.Result<boolean, string> => {
+/** Is `full` inside `cidr` (e.g. 2001:db8::/32)? A bad range gives `{ error }`. */
+export const inCidr = (full: string, cidr: string): { readonly inRange: boolean } | { readonly error: string } => {
   const [range = "", prefixText] = cidr.trim().split("/")
-  if (!prefixText) return R.fail("Use CIDR notation: address/prefix")
+  if (!prefixText) return { error: "Use CIDR notation: address/prefix" }
   const prefix = Number(prefixText)
-  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 128) return R.fail("Prefix length must be between 0 and 128")
-  return Option.match(expandIpv6(range), {
-    onNone: () => R.fail("Invalid IPv6 range address"),
-    onSome: (r) => R.succeed(networkOf(full, prefix) === networkOf(r, prefix)),
-  })
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 128) return { error: "Prefix length must be between 0 and 128" }
+  const r = expandIpv6(range)
+  if (r === undefined) return { error: "Invalid IPv6 range address" }
+  return { inRange: networkOf(full, prefix) === networkOf(r, prefix) }
 }
 
 // --- Input ----------------------------------------------------------------------
 
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s.trim())
+export interface Input {
+  /** Expanded; absent with use=mine, or when not given (then run asks for it). */
+  readonly address?: string
+  readonly prefix: number
+  readonly cidr?: string
+  /** use=mine takes the address the request came from. */
+  readonly mine: boolean
+}
 
-const Ipv6 = Schema.String.pipe(
-  Schema.decode(SchemaTransformation.transform({ decode: (s) => Option.getOrElse(expandIpv6(s), () => s), encode: (s) => s })),
-  Schema.check(Schema.makeFilter((s: string) => Option.isSome(expandIpv6(s)), { message: "invalid IPv6 address" })),
-)
-
-const Prefix = Schema.FiniteFromString.check(
-  Schema.makeFilter((n: number) => Number.isInteger(n) && n >= 0 && n <= 128, { message: "prefix must be an integer 0-128" }),
-)
-
-const Params = Schema.Struct({
-  address: Schema.optional(Schema.String),
-  prefix: Schema.optional(Schema.String),
-  cidr: Schema.optional(Schema.String),
-  use: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({
-      address: Schema.optionalKey(Ipv6),
-      prefix: Prefix,
-      cidr: Schema.optionalKey(Schema.String),
-      // use=mine takes the address the request came from.
-      mine: Schema.Boolean,
-    }),
-    SchemaTransformation.transform({
-      decode: (q) => {
-        const address = blank(q.address)
-        const cidr = blank(q.cidr)
-        return {
-          ...(address === undefined ? {} : { address }),
-          prefix: blank(q.prefix) ?? "64",
-          ...(cidr === undefined ? {} : { cidr }),
-          mine: blank(q.use) === "mine",
-        }
-      },
-      encode: ({ mine, ...rest }) => (mine ? { ...rest, use: "mine" } : rest),
-    }),
-  ),
-)
-type Input = typeof Params.Type
+export const parse = (query: Tool.Query): Input => {
+  const raw = optional(query, "address")
+  const address = raw === undefined ? undefined : expandIpv6(raw)
+  if (raw !== undefined && address === undefined) throw new Tool.InputError("address: invalid IPv6 address")
+  const cidr = optional(query, "cidr")
+  return {
+    ...(address === undefined ? {} : { address }),
+    prefix: integer(query, "prefix", { min: 0, max: 128, fallback: 64 }),
+    ...(cidr === undefined ? {} : { cidr }),
+    mine: optional(query, "use") === "mine",
+  }
+}
 
 // --- Result ---------------------------------------------------------------------
 
@@ -176,34 +155,26 @@ export interface Result extends Details {
 }
 
 // The visitor's own address, which must be IPv6.
-const visitorAddress = Effect.gen(function*() {
-  const visitor = yield* Tool.Visitor
-  return yield* Option.match(Option.flatMap(visitor.ip, expandIpv6), {
-    onSome: Effect.succeed,
-    onNone: () =>
-      Effect.fail(
-        new Tool.InputError({
-          message: Option.match(visitor.ip, {
-            onSome: (ip) => `No IPv6 address found: you are connecting over IPv4 (${ip}).`,
-            onNone: () => "No IPv6 address found.",
-          }),
-        }),
-      ),
-  })
-})
+const visitorAddress = (visitor: Tool.Visitor): string => {
+  const address = visitor.ip === undefined ? undefined : expandIpv6(visitor.ip)
+  if (address !== undefined) return address
+  throw new Tool.InputError(
+    visitor.ip === undefined
+      ? "use: no IPv6 address found."
+      : `use: no IPv6 address found, you are connecting over IPv4 (${visitor.ip}).`,
+  )
+}
 
-export const analyze = Effect.fnUntraced(function*(input: Input) {
-  const address = input.mine
-    ? yield* visitorAddress
-    : input.address ?? (yield* new Tool.InputError({ message: "address is required" }))
+export const analyze = async (input: Input, visitor: Tool.Visitor): Promise<Result> => {
+  const address = input.mine ? visitorAddress(visitor) : input.address
+  if (address === undefined) throw new Tool.InputError("address: required, e.g. address=2001:db8::1")
   const details = describeIpv6(address, input.prefix)
-  if (input.cidr === undefined) return details satisfies Result
-  const cidr = input.cidr
-  return R.match(inCidr(address, cidr), {
-    onSuccess: (inRange): Result => ({ ...details, cidr, inRange }),
-    onFailure: (cidrError): Result => ({ ...details, cidr, cidrError }),
-  })
-})
+  if (input.cidr === undefined) return details
+  const check = inCidr(address, input.cidr)
+  return "error" in check
+    ? { ...details, cidr: input.cidr, cidrError: check.error }
+    : { ...details, cidr: input.cidr, inRange: check.inRange }
+}
 
 // --- Views ----------------------------------------------------------------------
 
@@ -264,7 +235,13 @@ export const ipv6Utils = Tool.make<Input, Result>({
   title: "IPv6 utils",
   summary: "Expand and compress an IPv6 address, find its network for a prefix length, and check it against a CIDR range.",
   category: "Network",
-  params: Params,
+  params: {
+    address: { description: "IPv6 address, compressed or expanded (required unless use=mine)" },
+    prefix: { description: "Prefix length for the network, 0 to 128", default: "64" },
+    cidr: { description: "Range to check the address against, e.g. 2001:db8::/32" },
+    use: { description: "mine: analyze the address the request came from", values: ["mine"] },
+  },
+  parse,
   run: analyze,
   Form,
   Result,

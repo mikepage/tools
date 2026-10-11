@@ -2,9 +2,8 @@
 // link, script, iframe and form target, grouped by destination domain, with
 // the domains that look like injected spam flagged.
 
-import { Duration, Effect, Schema, SchemaTransformation } from "effect"
-import { HttpClient, HttpClientRequest } from "effect/http"
 import { Field, Status, Summary, Table } from "../app/ui.tsx"
+import { optional } from "../lib/params.ts"
 import * as Tool from "./Tool.ts"
 
 // Limits so one request can't crawl unbounded or hang. Each page is one
@@ -12,7 +11,7 @@ import * as Tool from "./Tool.ts"
 // as a page error.
 export const MAX_PAGES_CAP = 100
 const CONCURRENCY = 4
-const TIMEOUT = Duration.seconds(12)
+const TIMEOUT_MS = 12_000
 // Rows per domain in the page; the JSON keeps every reference.
 const ROWS_PER_DOMAIN = 50
 
@@ -93,14 +92,14 @@ const tldOf = (domain: string) => domain.toLowerCase().split(".").filter(Boolean
 const isStandardTld = (tld: string) => /^[a-z]{2}$/.test(tld) || CLASSIC_GTLDS.has(tld)
 
 // --- Extracting references from HTML ----------------------------------------------
-// No DOM library: only attributes off a fixed set of tags are needed, so a few
-// regular expressions over server-rendered HTML do the job.
+// HTMLRewriter streams the page through element handlers for the few tags that
+// matter. Comments are never matched, so commented-out tags are skipped.
 
 const NAMED_ENTITIES: Readonly<Record<string, string>> = {
   amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
 }
 
-/** Minimal HTML-entity decode, enough for attribute values (esp. `&amp;` in URLs). */
+/** Minimal HTML-entity decode; HTMLRewriter hands out attributes and text undecoded. */
 const decodeEntities = (s: string) =>
   s.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (m, body: string) => {
     if (body[0] === "#") {
@@ -110,22 +109,12 @@ const decodeEntities = (s: string) =>
     return NAMED_ENTITIES[body.toLowerCase()] ?? m
   })
 
-/** The attributes of a start tag, with lowercased names. */
-const parseAttrs = (attrText: string) => {
-  const attrs = new Map<string, string>()
-  for (const m of attrText.matchAll(/([^\s=/>"']+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+))?/g)) {
-    const name = m[1]!.toLowerCase()
-    let value = m[2] ?? ""
-    if (value.length >= 2 && (value[0] === '"' || value[0] === "'")) value = value.slice(1, -1)
-    if (!attrs.has(name)) attrs.set(name, decodeEntities(value))
-  }
-  return attrs
-}
+const TEXT_MAX = 120
 
-/** Visible text of an element body: tags stripped, entities decoded, whitespace collapsed. */
-const innerText = (body: string, max = 120) => {
-  const text = decodeEntities(body.replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim()
-  return text.length <= max ? text : text.slice(0, max) + "…"
+/** Visible text of an anchor: entities decoded, whitespace collapsed, capped. */
+const cleanText = (raw: string) => {
+  const text = decodeEntities(raw).replace(/\s+/g, " ").trim()
+  return text.length <= TEXT_MAX ? text : text.slice(0, TEXT_MAX) + "…"
 }
 
 export interface PageRefs {
@@ -135,28 +124,45 @@ export interface PageRefs {
   readonly forms: Array<string>
 }
 
-/** Links, scripts, iframes and form targets in a page, as absolute http(s) URLs. */
-export const extractRefs = (rawHtml: string, baseUrl: string): PageRefs => {
+/** Links, scripts, iframes and form targets in a page, as absolute http(s) URLs. Reads the whole body. */
+export const extractRefs = async (page: Response | string, baseUrl: string): Promise<PageRefs> => {
   const result: PageRefs = { anchors: [], scripts: [], iframes: [], forms: [] }
-  // Drop comments so commented-out tags are never extracted.
-  const html = rawHtml.replace(/<!--[\s\S]*?-->/g, "")
-  // Anchors as whole elements, so the link text comes along.
-  for (const m of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
-    const attrs = parseAttrs(m[1]!)
-    const href = attrs.get("href")
-    const abs = href ? resolveHttpUrl(href, baseUrl) : undefined
-    if (abs) result.anchors.push({ url: abs, text: innerText(m[2]!), rel: attrs.get("rel") ?? "" })
-  }
-  const collect = (tag: string, attr: string, into: Array<string>) => {
-    for (const m of html.matchAll(new RegExp(`<${tag}\\b([^>]*)>`, "gi"))) {
-      const raw = parseAttrs(m[1]!).get(attr)
-      const abs = raw ? resolveHttpUrl(raw, baseUrl) : undefined
+  const response = typeof page === "string" ? new Response(page, { headers: { "content-type": "text/html" } }) : page
+  const resolve = (raw: string | null) => (raw ? resolveHttpUrl(decodeEntities(raw), baseUrl) : undefined)
+  const collect = (attr: string, into: Array<string>): HTMLRewriterElementContentHandlers => ({
+    element: (el) => {
+      const abs = resolve(el.getAttribute(attr))
       if (abs) into.push(abs)
-    }
-  }
-  collect("script", "src", result.scripts)
-  collect("iframe", "src", result.iframes)
-  collect("form", "action", result.forms)
+    },
+  })
+  // The anchor being read, so its text chunks land on it. A nested <a> is
+  // invalid HTML; the innermost one gets the text.
+  const open: Array<{ url: string; rel: string; text: string }> = []
+  const rewriter = new HTMLRewriter()
+    .on("a[href]", {
+      element: (el) => {
+        const url = resolve(el.getAttribute("href"))
+        if (!url) return
+        const anchor = { url, rel: decodeEntities(el.getAttribute("rel") ?? ""), text: "" }
+        open.push(anchor)
+        el.onEndTag(() => {
+          const i = open.lastIndexOf(anchor)
+          if (i >= 0) open.splice(i, 1)
+          result.anchors.push({ url: anchor.url, text: cleanText(anchor.text), rel: anchor.rel })
+        })
+      },
+      text: (chunk) => {
+        const anchor = open.at(-1)
+        // Stop collecting well past the cap; the rest is cut anyway.
+        if (anchor && anchor.text.length < TEXT_MAX * 4) anchor.text += chunk.text
+      },
+    })
+    .on("script[src]", collect("src", result.scripts))
+    .on("iframe[src]", collect("src", result.iframes))
+    .on("form[action]", collect("action", result.forms))
+  await rewriter.transform(response).arrayBuffer()
+  // An anchor without a closing tag never fired onEndTag.
+  for (const anchor of open) result.anchors.push({ url: anchor.url, text: cleanText(anchor.text), rel: anchor.rel })
   return result
 }
 
@@ -265,61 +271,78 @@ const HEADERS = {
   "accept-language": "en-US,en;q=0.9",
 }
 
-interface FetchedPage {
-  readonly finalUrl: string
-  readonly html: string
-  readonly error?: string
+interface ScannedPage {
+  readonly result: PageResult
+  readonly internalLinks: ReadonlyArray<string>
+  readonly externalRefs: ReadonlyArray<ExternalRef>
 }
 
+const describeError = (error: unknown) =>
+  error instanceof DOMException && error.name === "TimeoutError"
+    ? `timed out after ${TIMEOUT_MS / 1000} s`
+    : `fetch failed: ${error instanceof Error ? error.message : String(error)}`
+
 // One page. A failure here is part of the report (a page error), not a
-// failure of the scan, so this cannot fail: transport errors, timeouts and
-// non-2xx statuses all become `error`.
-const fetchPage = (url: string): Effect.Effect<FetchedPage, never, HttpClient.HttpClient> =>
-  Effect.gen(function*() {
-    const client = yield* HttpClient.HttpClient
-    const res = yield* client.execute(HttpClientRequest.get(url, { headers: HEADERS }))
-    if (res.status < 200 || res.status >= 300) return { finalUrl: url, html: "", error: `HTTP ${res.status}` }
-    const contentType = res.headers["content-type"] ?? ""
+// failure of the scan, so this never throws: transport errors, timeouts and
+// non-2xx statuses all become an error on the page. The timeout covers
+// reading the body too.
+const scanPage = async (url: string, siteDomain: string): Promise<ScannedPage> => {
+  const internalLinks: Array<string> = []
+  const externalRefs: Array<ExternalRef> = []
+  const failed = (error: string): ScannedPage => ({ result: { url, externalRefs: 0, errors: [error] }, internalLinks, externalRefs })
+
+  let refs: PageRefs
+  try {
+    const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(TIMEOUT_MS) })
+    if (res.status < 200 || res.status >= 300) {
+      await res.body?.cancel()
+      return failed(`HTTP ${res.status}`)
+    }
+    const contentType = res.headers.get("content-type") ?? ""
     // Only HTML is worth reading; anything else is skipped unread.
-    const html = contentType.includes("html") || contentType === "" ? yield* res.text : ""
-    return { finalUrl: res.url || url, html }
-  }).pipe(
-    Effect.timeoutOrElse({
-      duration: TIMEOUT,
-      orElse: () => Effect.succeed({ finalUrl: url, html: "", error: `timed out after ${Duration.toSeconds(TIMEOUT)} s` }),
-    }),
-    Effect.catch((e) => Effect.succeed({ finalUrl: url, html: "", error: `fetch failed: ${e.message}` })),
-  )
-
-const scanPage = (url: string, siteDomain: string) =>
-  Effect.map(fetchPage(url), (page) => {
-    const internalLinks: Array<string> = []
-    const externalRefs: Array<ExternalRef> = []
-    const errors = page.error ? [page.error] : []
-    if (page.error || !page.html) return { result: { url, externalRefs: 0, errors }, internalLinks, externalRefs }
-
-    const refs = extractRefs(page.html, page.finalUrl)
-    const push = (target: string, kind: RefKind, text = "", rel = "") => {
-      const host = hostOf(target)
-      if (!host) return
-      const nofollow = rel.toLowerCase().split(/[\s,]+/).includes("nofollow")
-      externalRefs.push({ url: target, host, kind, page: url, text, rel, nofollow })
+    if (!(contentType.includes("html") || contentType === "")) {
+      await res.body?.cancel()
+      return { result: { url, externalRefs: 0, errors: [] }, internalLinks, externalRefs }
     }
-    for (const a of refs.anchors) {
-      if (sameSite(a.url, siteDomain)) internalLinks.push(a.url)
-      else push(a.url, "link", a.text, a.rel)
+    refs = await extractRefs(res, res.url || url)
+  } catch (error) {
+    return failed(describeError(error))
+  }
+
+  const push = (target: string, kind: RefKind, text = "", rel = "") => {
+    const host = hostOf(target)
+    if (!host) return
+    const nofollow = rel.toLowerCase().split(/[\s,]+/).includes("nofollow")
+    externalRefs.push({ url: target, host, kind, page: url, text, rel, nofollow })
+  }
+  for (const a of refs.anchors) {
+    if (sameSite(a.url, siteDomain)) internalLinks.push(a.url)
+    else push(a.url, "link", a.text, a.rel)
+  }
+  for (const s of refs.scripts) if (!sameSite(s, siteDomain)) push(s, "script")
+  for (const f of refs.iframes) if (!sameSite(f, siteDomain)) push(f, "iframe")
+  for (const f of refs.forms) if (!sameSite(f, siteDomain)) push(f, "form")
+  return { result: { url, externalRefs: externalRefs.length, errors: [] }, internalLinks, externalRefs }
+}
+
+/** Maps `items` with at most `limit` calls in flight; results keep the input order. */
+const mapLimit = async <T, R>(items: ReadonlyArray<T>, limit: number, f: (item: T) => Promise<R>): Promise<Array<R>> => {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++
+      results[i] = await f(items[i]!)
     }
-    for (const s of refs.scripts) if (!sameSite(s, siteDomain)) push(s, "script")
-    for (const f of refs.iframes) if (!sameSite(f, siteDomain)) push(f, "iframe")
-    for (const f of refs.forms) if (!sameSite(f, siteDomain)) push(f, "form")
-    const result: PageResult = { url, externalRefs: externalRefs.length, errors }
-    return { result, internalLinks, externalRefs }
-  })
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
 
 // Breadth first: each level is fetched with at most CONCURRENCY requests in
 // flight, and the links it finds become the next level, until maxPages pages
 // have been fetched or nothing is left.
-export const scan = Effect.fnUntraced(function*(input: Input) {
+export const scan = async (input: Input): Promise<Result> => {
   const start = new URL(input.url)
   const startedAt = new Date().toISOString()
   const siteDomain = registrableDomain(start.hostname)
@@ -330,7 +353,7 @@ export const scan = Effect.fnUntraced(function*(input: Input) {
   let frontier = [...seen]
   while (frontier.length > 0 && pages.length < input.maxPages) {
     const level = frontier.slice(0, input.maxPages - pages.length)
-    const results = yield* Effect.forEach(level, (url) => scanPage(url, siteDomain), { concurrency: CONCURRENCY })
+    const results = await mapLimit(level, CONCURRENCY, (url) => scanPage(url, siteDomain))
     frontier = []
     for (const { result, internalLinks, externalRefs } of results) {
       pages.push(result)
@@ -350,7 +373,7 @@ export const scan = Effect.fnUntraced(function*(input: Input) {
   // Nothing to report when even the start page failed.
   const first = pages[0]
   if (first && first.errors.length > 0) {
-    return yield* new Tool.UpstreamError({ message: `Could not fetch ${first.url}: ${first.errors.join(", ")}` })
+    throw new Tool.UpstreamError(`Could not fetch ${first.url}: ${first.errors.join(", ")}`)
   }
 
   const domains = groupByDomain(refs)
@@ -363,37 +386,26 @@ export const scan = Effect.fnUntraced(function*(input: Input) {
     suspiciousDomains: domains.filter((d) => d.suspicious).length,
     domains,
     pages,
-  } satisfies Result
-})
+  }
+}
 
 // --- Input ----------------------------------------------------------------------------
 
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s.trim())
+export interface Input {
+  /** Normalized http(s) URL. */
+  readonly url: string
+  readonly maxPages: number
+}
 
-// The start URL, normalized while decoding.
-const Url = Schema.String.pipe(
-  Schema.decode(SchemaTransformation.transform({ decode: (s) => normalizeTarget(s)?.href ?? s, encode: (s) => s })),
-  Schema.check(Schema.makeFilter((s: string) => normalizeTarget(s) !== undefined || "Please enter a valid http(s) URL.")),
-)
-
-// Above the cap is clamped to it.
-const MaxPages = Schema.FiniteFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1)).pipe(
-  Schema.decode(SchemaTransformation.transform({ decode: (n) => Math.min(n, MAX_PAGES_CAP), encode: (n) => n })),
-)
-
-const Params = Schema.Struct({
-  url: Schema.optional(Schema.String),
-  maxPages: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({ url: Url, maxPages: MaxPages }),
-    SchemaTransformation.transform({
-      decode: (q) => ({ url: blank(q.url) ?? "", maxPages: blank(q.maxPages) ?? String(MAX_PAGES_CAP) }),
-      encode: (i) => ({ url: i.url, maxPages: String(i.maxPages) }),
-    }),
-  ),
-)
-type Input = typeof Params.Type
+export const parse = (query: Tool.Query): Input => {
+  const url = normalizeTarget(optional(query, "url") ?? "")
+  if (url === undefined) throw new Tool.InputError("url: please enter a valid http(s) URL, e.g. url=example.com")
+  // Above the cap is clamped to it.
+  const raw = optional(query, "maxPages")
+  const maxPages = raw === undefined ? MAX_PAGES_CAP : Number(raw)
+  if (!Number.isInteger(maxPages) || maxPages < 1) throw new Tool.InputError("maxPages: expected a whole number of 1 or more")
+  return { url: url.href, maxPages: Math.min(maxPages, MAX_PAGES_CAP) }
+}
 
 // --- Views ------------------------------------------------------------------------------
 
@@ -533,7 +545,11 @@ export const externalLinkScanner = Tool.make<Input, Result>({
   title: "External link scanner",
   summary: "Crawl a site and list every external link, script, iframe and form target by domain, with likely spam flagged.",
   category: "Web",
-  params: Params,
+  params: {
+    url: { description: "Site to crawl; a bare domain means https", required: true },
+    maxPages: { description: `Pages to fetch, 1 to ${MAX_PAGES_CAP}; more is clamped`, default: String(MAX_PAGES_CAP) },
+  },
+  parse,
   run: scan,
   Form,
   Result,

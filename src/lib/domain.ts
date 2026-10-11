@@ -1,10 +1,11 @@
 // Domain input: people paste URLs, trailing dots and mixed case.
 
-import { Schema, SchemaTransformation } from "effect"
+import { InputError, type Query } from "../tools/Tool.ts"
+import { required } from "./params.ts"
 
 const LABEL = /^_?[a-z0-9]([a-z0-9-_]{0,61}[a-z0-9])?$/i
 
-/** Strips a scheme, path, port, `www.`-less; keeps the host, lowercased. */
+/** Strips a scheme, path and port; keeps the host, lowercased. */
 export const cleanDomain = (input: string): string => {
   let s = input.trim().toLowerCase()
   s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, "")
@@ -13,13 +14,16 @@ export const cleanDomain = (input: string): string => {
   return s
 }
 
+/** A domain or DNS name; labels may start with `_` (`_dmarc.example.com`). */
 export const isDomain = (name: string): boolean => {
   const labels = name.split(".")
   return name.length <= 253 && labels.length >= 2 && labels.every((l) => LABEL.test(l))
 }
 
-/** A domain or DNS name (labels may start with `_`), cleaned up while decoding. */
-export const Domain = Schema.String.pipe(
-  Schema.decode(SchemaTransformation.transform({ decode: cleanDomain, encode: (s) => s })),
-  Schema.check(Schema.makeFilter(isDomain, { expected: "a domain such as example.com" })),
-)
+/** Reads a domain parameter (or the first of several aliases), cleaned up. Throws InputError. */
+export const domainParam = (query: Query, keys: ReadonlyArray<string>, example = "example.com"): string => {
+  const key = keys.find((k) => query[k]?.trim()) ?? keys[0]!
+  const domain = cleanDomain(required(query, key, example))
+  if (!isDomain(domain)) throw new InputError(`${key}: expected a domain such as ${example}`)
+  return domain
+}

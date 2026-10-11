@@ -1,11 +1,12 @@
 // SPF validator: a domain's SPF record, every include and redirect walked into
 // a tree, DNS lookups counted against RFC 7208's limit of 10.
 
-import { Duration, Effect, Ref, Schema, SchemaTransformation } from "effect"
 import type { Html } from "../jsx/jsx-runtime.ts"
 import { Field, type Level, Select, Status, Summary } from "../app/ui.tsx"
 import * as Doh from "../lib/doh.ts"
-import { Domain, isDomain } from "../lib/domain.ts"
+import { domainParam, isDomain } from "../lib/domain.ts"
+import { since } from "../lib/http.ts"
+import { oneOf, optional } from "../lib/params.ts"
 import * as Tool from "./Tool.ts"
 
 /** RFC 7208 §4.6.4: at most 10 DNS-querying terms per evaluation. */
@@ -15,31 +16,26 @@ const LOOKUP_MECHANISMS = new Set(["include", "a", "mx", "ptr", "exists"])
 
 // --- Input ----------------------------------------------------------------------
 
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s)
+export const MAX_RECORD_LENGTH = 4096
 
-// `record` checks a draft instead of the published record.
-const Params = Schema.Struct({
-  domain: Schema.optional(Schema.String),
-  resolver: Schema.optional(Schema.String),
-  record: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({
-      domain: Domain,
-      resolver: Doh.ResolverParam,
-      record: Schema.UndefinedOr(Schema.String.check(Schema.isMaxLength(4096))),
-    }),
-    SchemaTransformation.transform({
-      decode: (q) => ({
-        domain: blank(q.domain) ?? "",
-        resolver: blank(q.resolver) ?? "cloudflare",
-        record: blank(q.record)?.trim(),
-      }),
-      encode: (i) => i,
-    }),
-  ),
-)
-type Input = typeof Params.Type
+export interface Input {
+  readonly domain: string
+  readonly resolver: Doh.Resolver
+  /** A draft to check instead of the published record. */
+  readonly record: string | undefined
+}
+
+export const parse = (query: Tool.Query): Input => {
+  const record = optional(query, "record")
+  if (record !== undefined && record.length > MAX_RECORD_LENGTH) {
+    throw new Tool.InputError(`record: at most ${MAX_RECORD_LENGTH} characters`)
+  }
+  return {
+    domain: domainParam(query, ["domain"]),
+    resolver: oneOf(query, "resolver", Doh.RESOLVER_NAMES, "cloudflare"),
+    record,
+  }
+}
 
 // --- Result ---------------------------------------------------------------------
 
@@ -164,83 +160,96 @@ const emptyNode = (domain: string, via: Node["via"], note: string | null = null)
   ms: 0,
 })
 
+interface Fetched {
+  readonly ms: number
+  readonly spf: ReadonlyArray<string>
+  readonly note: string | null
+}
+
 /** The SPF records among a name's TXT records, or why there are none. */
-const fetchSpf = (domain: string, resolver: Doh.Resolver) =>
-  Doh.query(domain, "TXT", { resolver }).pipe(
-    Effect.map(({ response, ms }) => {
-      if (response.Status !== 0) {
-        return { ms, spf: [], note: `DNS lookup failed: ${Doh.DNS_STATUS[response.Status] ?? `DNS error ${response.Status}`}` }
-      }
-      const txt = Doh.answersOf(response, 16).map((a) => Doh.unquoteTxt(a.data))
-      const spf = txt.filter((r) => /^v=spf1(\s|$)/i.test(r))
-      const note = spf.length > 0 ? null : txt.length > 0 ? `No SPF record among ${txt.length} TXT records` : "No TXT records"
-      return { ms, spf, note }
-    }),
+const fetchSpf = async (domain: string, resolver: Doh.Resolver): Promise<Fetched> => {
+  let answer: Awaited<ReturnType<typeof Doh.query>>
+  try {
+    answer = await Doh.query(domain, "TXT", { resolver })
+  } catch (error) {
     // A failed lookup is a note on its node; the rest of the tree goes on.
-    Effect.catchTag("UpstreamError", (e) => Effect.succeed({ ms: 0, spf: [] as Array<string>, note: e.message })),
-  )
+    if (error instanceof Tool.UpstreamError) return { ms: 0, spf: [], note: error.message }
+    throw error
+  }
+  const { response, ms } = answer
+  if (response.Status !== 0) {
+    return { ms, spf: [], note: `DNS lookup failed: ${Doh.DNS_STATUS[response.Status] ?? `DNS error ${response.Status}`}` }
+  }
+  const txt = Doh.answersOf(response, 16).map((a) => Doh.unquoteTxt(a.data))
+  const spf = txt.filter((r) => /^v=spf1(\s|$)/i.test(r))
+  const note = spf.length > 0 ? null : txt.length > 0 ? `No SPF record among ${txt.length} TXT records` : "No TXT records"
+  return { ms, spf, note }
+}
+
+/** The running DNS lookup count of one evaluation. */
+interface Counter {
+  n: number
+}
 
 // Depth first and sequential: the lookup counter decides which term is the
 // 11th, so the order of the queries matters.
-const walk = (
+const walk = async (
   domain: string,
   via: Node["via"],
   ancestors: ReadonlyArray<string>,
-  lookups: Ref.Ref<number>,
+  lookups: Counter,
   resolver: Doh.Resolver,
   supplied?: string,
-): Effect.Effect<Node, never, Tool.Services> =>
-  Effect.gen(function*() {
-    const node = emptyNode(domain, via)
-    const issues: Array<Issue> = []
+): Promise<Node> => {
+  const node = emptyNode(domain, via)
+  const issues: Array<Issue> = []
 
-    let record: string
-    if (supplied !== undefined) {
-      record = supplied
+  let record: string
+  if (supplied !== undefined) {
+    record = supplied
+  } else {
+    const got = await fetchSpf(domain, resolver)
+    node.ms = got.ms
+    if (got.note !== null) return { ...node, note: got.note }
+    if (got.spf.length > 1) issues.push({ level: "bad", text: `${got.spf.length} SPF records published: a permerror. Keep exactly one.` })
+    record = got.spf[0]!
+  }
+
+  const parsed = parseSpfRecord(record)
+  issues.push(...parsed.issues)
+  const path = [...ancestors, domain]
+  const hasAll = parsed.terms.some((t) => !t.modifier && t.type === "all")
+
+  const follow = async (term: ParsedTerm, kind: "include" | "redirect"): Promise<Term> => {
+    const target = term.value.toLowerCase().replace(/\.$/, "")
+    if (!target) return { ...term, lookup: null, child: null } // reported by parseSpfRecord
+    const lookup = ++lookups.n
+    let child: Node
+    if (!isDomain(target)) {
+      child = emptyNode(target, kind, target.includes("%") ? "Contains SPF macros, not expanded" : "Not a valid domain name")
+    } else if (path.includes(target)) {
+      child = emptyNode(target, kind, "Already in this chain: include loop")
+      issues.push({ level: "bad", text: `Include loop: ${target} includes itself.` })
+    } else if (lookup > MAX_LOOKUPS) {
+      child = emptyNode(target, kind, `DNS lookup limit exceeded (${MAX_LOOKUPS}), not followed`)
     } else {
-      const got = yield* fetchSpf(domain, resolver)
-      node.ms = got.ms
-      if (got.note !== null) return { ...node, note: got.note }
-      if (got.spf.length > 1) issues.push({ level: "bad", text: `${got.spf.length} SPF records published: a permerror. Keep exactly one.` })
-      record = got.spf[0]!
+      child = await walk(target, kind, path, lookups, resolver)
     }
+    return { ...term, lookup, child }
+  }
 
-    const parsed = parseSpfRecord(record)
-    issues.push(...parsed.issues)
-    const path = [...ancestors, domain]
-    const hasAll = parsed.terms.some((t) => !t.modifier && t.type === "all")
+  const terms: Array<Term> = []
+  for (const term of parsed.terms) {
+    if (!term.modifier && term.type === "include") terms.push(await follow(term, "include"))
+    else if (!term.modifier && LOOKUP_MECHANISMS.has(term.type)) terms.push({ ...term, lookup: ++lookups.n, child: null })
+    else terms.push({ ...term, lookup: null, child: null })
+  }
+  // redirect= is applied after all mechanisms, and only without "all".
+  const redirect = terms.findIndex((t) => t.type === "redirect" && t.modifier)
+  if (redirect !== -1 && !hasAll) terms[redirect] = await follow(terms[redirect]!, "redirect")
 
-    const follow = Effect.fnUntraced(function*(term: ParsedTerm, kind: "include" | "redirect") {
-      const target = term.value.toLowerCase().replace(/\.$/, "")
-      if (!target) return { ...term, lookup: null, child: null } // reported by parseSpfRecord
-      const lookup = yield* Ref.updateAndGet(lookups, (n) => n + 1)
-      let child: Node
-      if (!isDomain(target)) {
-        child = emptyNode(target, kind, target.includes("%") ? "Contains SPF macros, not expanded" : "Not a valid domain name")
-      } else if (path.includes(target)) {
-        child = emptyNode(target, kind, "Already in this chain: include loop")
-        issues.push({ level: "bad", text: `Include loop: ${target} includes itself.` })
-      } else if (lookup > MAX_LOOKUPS) {
-        child = emptyNode(target, kind, `DNS lookup limit exceeded (${MAX_LOOKUPS}), not followed`)
-      } else {
-        child = yield* walk(target, kind, path, lookups, resolver)
-      }
-      return { ...term, lookup, child }
-    })
-
-    const terms: Array<Term> = []
-    for (const term of parsed.terms) {
-      if (!term.modifier && term.type === "include") terms.push(yield* follow(term, "include"))
-      else if (!term.modifier && LOOKUP_MECHANISMS.has(term.type)) {
-        terms.push({ ...term, lookup: yield* Ref.updateAndGet(lookups, (n) => n + 1), child: null })
-      } else terms.push({ ...term, lookup: null, child: null })
-    }
-    // redirect= is applied after all mechanisms, and only without "all".
-    const redirect = terms.findIndex((t) => t.type === "redirect" && t.modifier)
-    if (redirect !== -1 && !hasAll) terms[redirect] = yield* follow(terms[redirect]!, "redirect")
-
-    return { ...node, record, version: parsed.version, terms, issues }
-  })
+  return { ...node, record, version: parsed.version, terms, issues }
+}
 
 const collectIssues = (node: Node, out: Array<Issue & { readonly domain: string }>): void => {
   if (node.note) out.push({ level: "bad", domain: node.domain, text: node.note })
@@ -248,10 +257,12 @@ const collectIssues = (node: Node, out: Array<Issue & { readonly domain: string 
   for (const t of node.terms) if (t.child) collectIssues(t.child, out)
 }
 
-export const evaluateSpf = Effect.fnUntraced(function*(input: Input) {
-  const lookups = yield* Ref.make(0)
-  const [elapsed, node] = yield* Effect.timed(walk(input.domain, "root", [], lookups, input.resolver, input.record))
-  const count = yield* Ref.get(lookups)
+export const evaluateSpf = async (input: Input): Promise<Result> => {
+  const lookups: Counter = { n: 0 }
+  const start = performance.now()
+  const node = await walk(input.domain, "root", [], lookups, input.resolver, input.record)
+  const queryTime = since(start)
+  const count = lookups.n
   const issues: Array<Issue & { readonly domain: string }> = []
   collectIssues(node, issues)
   if (count > MAX_LOOKUPS) {
@@ -268,10 +279,10 @@ export const evaluateSpf = Effect.fnUntraced(function*(input: Input) {
     node,
     lookups: count,
     maxLookups: MAX_LOOKUPS,
-    queryTime: Math.round(Duration.toMillis(elapsed)),
+    queryTime,
     issues,
-  } satisfies Result
-})
+  }
+}
 
 // --- Views ----------------------------------------------------------------------
 
@@ -414,7 +425,12 @@ export const spfValidator = Tool.make<Input, Result>({
   title: "SPF validator",
   summary: "Walk a domain's SPF record and every include, and count the 10-lookup budget.",
   category: "Email",
-  params: Params,
+  params: {
+    domain: { description: "Domain whose SPF record to walk", required: true },
+    resolver: { description: "DNS-over-HTTPS resolver", default: "cloudflare", values: Doh.RESOLVER_NAMES },
+    record: { description: `A draft SPF record to check instead of the published one (at most ${MAX_RECORD_LENGTH} characters)` },
+  },
+  parse,
   run: evaluateSpf,
   Form,
   Result,

@@ -1,18 +1,13 @@
-import { ManagedRuntime } from "effect"
-import { FetchHttpClient } from "effect/http"
-import { afterAll, describe, expect, it } from "vitest"
-import { makeHandler } from "../src/app/handler.ts"
-import { dmarcValidator } from "../src/tools/dmarc-validator.tsx"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { startWorker, type TestWorker } from "./helpers.ts"
 
-const runtime = ManagedRuntime.make(FetchHttpClient.layer)
-const handle = makeHandler([dmarcValidator])
-afterAll(() => runtime.dispose())
+let worker: TestWorker
+beforeAll(async () => {
+  worker = await startWorker({ module: "src/tools/dmarc-validator.tsx", export: "dmarcValidator" })
+})
+afterAll(() => worker?.dispose())
 
-const get = async (path: string) => {
-  const response = await runtime.runPromise(handle(new Request(`https://tools.test${path}`)))
-  return { status: response.status, text: await response.text() }
-}
-const api = async (query: string) => JSON.parse((await get(`/dmarc-validator/api?${query}`)).text)
+const api = async (query: string) => JSON.parse((await worker.get(`/dmarc-validator/api?${query}`)).text)
 
 describe("dmarc-validator", () => {
   it("reads google.com's reject policy", async () => {
@@ -39,16 +34,16 @@ describe("dmarc-validator", () => {
     expect(await api("domain=dnssec-failed.org")).toMatchObject({ status: 2, dnsError: "Server failure" })
   })
 
-  it("rejects bad input with 400", async () => {
-    for (const q of ["", "domain=not%20a%20domain", "domain=google.com&resolver=nope"]) {
-      const { status, text } = await get(`/dmarc-validator/api?${q}`)
+  it("rejects bad input with 400 and names the parameter", async () => {
+    for (const [q, param] of [["", "domain"], ["domain=not%20a%20domain", "domain"], ["domain=_dmarc.com", "domain"], ["domain=google.com&resolver=nope", "resolver"]]) {
+      const { status, text } = await worker.get(`/dmarc-validator/api?${q}`)
       expect(status, q).toBe(400)
-      expect(JSON.parse(text)).toHaveProperty("error")
+      expect(JSON.parse(text).error, q).toMatch(new RegExp(`^${param}:`))
     }
   })
 
   it("renders the policy, checks and tags", async () => {
-    const { status, text } = await get("/dmarc-validator?domain=google.com")
+    const { status, text } = await worker.get("/dmarc-validator?domain=google.com")
     expect(status).toBe(200)
     expect(text).toContain("strict DMARC policy")
     expect(text).toContain("Meaning")

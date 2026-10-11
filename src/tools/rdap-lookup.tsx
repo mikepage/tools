@@ -2,72 +2,81 @@
 // structured successor to WHOIS. The registry's RDAP server comes from a
 // bundled copy of the IANA bootstrap registry.
 
-import { DateTime, Duration, Effect, Schema, SchemaTransformation } from "effect"
-import { HttpClient } from "effect/http"
 import bootstrap from "../data/rdap-bootstrap.json" with { type: "json" }
 import { Check, Field, KeyValue, Status, Summary, Table } from "../app/ui.tsx"
-import { Domain } from "../lib/domain.ts"
+import { domainParam } from "../lib/domain.ts"
+import { isArrayOf, isRecord, since } from "../lib/http.ts"
+import { flag } from "../lib/params.ts"
 import * as Tool from "./Tool.ts"
 
 // --- Input ----------------------------------------------------------------------
 
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s)
-const isOn = (s: string | undefined) => s !== undefined && /^(1|true|on|yes)$/i.test(s)
+export interface Input {
+  readonly domain: string
+  readonly raw: boolean
+}
 
 // `raw=1` adds the registry's full response to the JSON.
-const Params = Schema.Struct({
-  domain: Schema.optional(Schema.String),
-  raw: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({ domain: Domain, raw: Schema.Boolean }),
-    SchemaTransformation.transform({
-      decode: (q) => ({ domain: blank(q.domain) ?? "", raw: isOn(q.raw) }),
-      encode: (i) => ({ domain: i.domain, raw: i.raw ? "1" : "0" }),
-    }),
-  ),
-)
-type Input = typeof Params.Type
+export const parse = (query: Tool.Query): Input => ({
+  domain: domainParam(query, ["domain"]),
+  raw: flag(query, "raw", false),
+})
 
 // --- The RDAP response ------------------------------------------------------------
 
 // Only the fields the summary reads, all optional: registries differ, and one
 // missing field should not fail the lookup. Unknown keys are ignored.
-const RdapEntity = Schema.Struct({
-  roles: Schema.optional(Schema.Array(Schema.String)),
-  publicIds: Schema.optional(Schema.Array(Schema.Struct({ type: Schema.String, identifier: Schema.String }))),
+interface RdapEntity {
+  readonly roles?: ReadonlyArray<string>
+  readonly publicIds?: ReadonlyArray<{ readonly type: string; readonly identifier: string }>
   // jCard: ["vcard", [[name, params, type, value], ...]]
-  vcardArray: Schema.optional(Schema.Tuple([Schema.String, Schema.Array(Schema.Array(Schema.Unknown))])),
-})
-type RdapEntity = typeof RdapEntity.Type
+  readonly vcardArray?: readonly [string, ReadonlyArray<ReadonlyArray<unknown>>]
+}
 
-const DsRecord = Schema.Struct({
-  keyTag: Schema.Number,
-  algorithm: Schema.Number,
-  digestType: Schema.Number,
-  digest: Schema.String,
-})
-export type DsRecord = typeof DsRecord.Type
+export interface DsRecord {
+  readonly keyTag: number
+  readonly algorithm: number
+  readonly digestType: number
+  readonly digest: string
+}
 
-const RdapDomain = Schema.Struct({
-  ldhName: Schema.optional(Schema.String),
-  handle: Schema.optional(Schema.String),
-  status: Schema.optional(Schema.Array(Schema.String)),
-  events: Schema.optional(Schema.Array(Schema.Struct({ eventAction: Schema.String, eventDate: Schema.String }))),
-  nameservers: Schema.optional(Schema.Array(Schema.Struct({
-    ldhName: Schema.optional(Schema.String),
-    ipAddresses: Schema.optional(Schema.Struct({
-      v4: Schema.optional(Schema.Array(Schema.String)),
-      v6: Schema.optional(Schema.Array(Schema.String)),
-    })),
-  }))),
-  entities: Schema.optional(Schema.Array(RdapEntity)),
-  secureDNS: Schema.optional(Schema.Struct({
-    delegationSigned: Schema.optional(Schema.Boolean),
-    dsData: Schema.optional(Schema.Array(DsRecord)),
-  })),
-})
-type RdapDomain = typeof RdapDomain.Type
+export interface RdapDomain {
+  readonly ldhName?: string
+  readonly handle?: string
+  readonly status?: ReadonlyArray<string>
+  readonly events?: ReadonlyArray<{ readonly eventAction: string; readonly eventDate: string }>
+  readonly nameservers?: ReadonlyArray<{
+    readonly ldhName?: string
+    readonly ipAddresses?: { readonly v4?: ReadonlyArray<string>; readonly v6?: ReadonlyArray<string> }
+  }>
+  readonly entities?: ReadonlyArray<RdapEntity>
+  readonly secureDNS?: { readonly delegationSigned?: boolean; readonly dsData?: ReadonlyArray<DsRecord> }
+}
+
+// Shape guards: what the summary reads must have the right type when present.
+const isString = (v: unknown): v is string => typeof v === "string"
+const isNumber = (v: unknown): v is number => typeof v === "number"
+const opt = (v: unknown, check: (x: unknown) => boolean) => v === undefined || check(v)
+const strings = (v: unknown) => isArrayOf(v, isString)
+
+const isEntity = (v: unknown): v is RdapEntity =>
+  isRecord(v) && opt(v["roles"], strings) &&
+  opt(v["publicIds"], (x) => isArrayOf(x, (id): id is unknown => isRecord(id) && isString(id["type"]) && isString(id["identifier"]))) &&
+  opt(v["vcardArray"], (x) => Array.isArray(x) && x.length === 2 && isString(x[0]) && isArrayOf(x[1], (row): row is unknown => Array.isArray(row)))
+
+const isDsRecord = (v: unknown): v is DsRecord =>
+  isRecord(v) && isNumber(v["keyTag"]) && isNumber(v["algorithm"]) && isNumber(v["digestType"]) && isString(v["digest"])
+
+const isNameserver = (v: unknown): boolean =>
+  isRecord(v) && opt(v["ldhName"], isString) &&
+  opt(v["ipAddresses"], (ip) => isRecord(ip) && opt(ip["v4"], strings) && opt(ip["v6"], strings))
+
+export const isRdapDomain = (v: unknown): v is RdapDomain =>
+  isRecord(v) && opt(v["ldhName"], isString) && opt(v["handle"], isString) && opt(v["status"], strings) &&
+  opt(v["events"], (x) => isArrayOf(x, (e): e is unknown => isRecord(e) && isString(e["eventAction"]) && isString(e["eventDate"]))) &&
+  opt(v["nameservers"], (x) => isArrayOf(x, (ns): ns is unknown => isNameserver(ns))) &&
+  opt(v["entities"], (x) => isArrayOf(x, isEntity)) &&
+  opt(v["secureDNS"], (d) => isRecord(d) && opt(d["delegationSigned"], (b) => typeof b === "boolean") && opt(d["dsData"], (x) => isArrayOf(x, isDsRecord)))
 
 // --- Result ---------------------------------------------------------------------
 
@@ -159,53 +168,62 @@ export const summarize = (domain: string, rdap: RdapDomain, rdapServer: string, 
 
 // --- The lookup -----------------------------------------------------------------
 
-const TIMEOUT = Duration.seconds(10)
+const TIMEOUT_MS = 10_000
 
-export const lookup = Effect.fnUntraced(function*(input: Input) {
+const describeError = (error: unknown): string =>
+  error instanceof DOMException && error.name === "TimeoutError"
+    ? "RDAP lookup timed out."
+    : `RDAP lookup failed: ${error instanceof Error ? error.message : String(error)}`
+
+export const lookup = async (input: Input): Promise<Result> => {
   const { domain } = input
   const rdapServer = serverFor(domain)
   if (!rdapServer) {
     const tld = domain.slice(domain.lastIndexOf(".") + 1)
-    return yield* new Tool.UpstreamError({ message: `TLD ".${tld}" is not supported by RDAP: the IANA registry lists no server for it.` })
+    throw new Tool.UpstreamError(`TLD ".${tld}" is not supported by RDAP: the IANA registry lists no server for it.`)
   }
 
-  // Some registry servers drop idle keep-alive connections; retryTransient
-  // retries a failed connection (or a 5xx) once.
-  const client = (yield* HttpClient.HttpClient).pipe(HttpClient.retryTransient({ times: 1 }))
+  // One timeout for the whole lookup, retry included.
+  const signal = AbortSignal.timeout(TIMEOUT_MS)
+  const request = () =>
+    fetch(`${rdapServer}domain/${domain}`, {
+      headers: { accept: "application/rdap+json", "user-agent": "tools.mikepage.nl rdap-lookup" },
+      signal,
+    })
 
-  const [elapsed, data] = yield* client.get(`${rdapServer}domain/${domain}`, {
-    headers: { accept: "application/rdap+json", "user-agent": "tools.mikepage.nl rdap-lookup" },
-  }).pipe(
-    Effect.flatMap((res) =>
-      Effect.gen(function*() {
-        if (res.status === 404) return yield* new Tool.UpstreamError({ message: `Domain "${domain}" not found in RDAP registry.` })
-        if (res.status < 200 || res.status >= 300) {
-          return yield* new Tool.UpstreamError({ message: `RDAP lookup failed with status ${res.status}.` })
-        }
-        return yield* res.json
-      })
-    ),
-    Effect.timeout(TIMEOUT),
-    Effect.timed,
-    Effect.mapError((cause) =>
-      cause._tag === "UpstreamError" ? cause : new Tool.UpstreamError({
-        message: cause._tag === "TimeoutError" ? "RDAP lookup timed out." : `RDAP lookup failed: ${cause.message}`,
-        cause,
-      })
-    ),
-  )
+  const start = performance.now()
+  let data: unknown
+  try {
+    // Some registry servers drop idle keep-alive connections: a failed
+    // connection or a 5xx is retried once.
+    let response: Response
+    try {
+      response = await request()
+      if (response.status >= 500) {
+        await response.body?.cancel()
+        response = await request()
+      }
+    } catch (error) {
+      if (signal.aborted) throw error
+      response = await request()
+    }
+    if (response.status === 404) throw new Tool.UpstreamError(`Domain "${domain}" not found in RDAP registry.`)
+    if (!response.ok) throw new Tool.UpstreamError(`RDAP lookup failed with status ${response.status}.`)
+    data = await response.json()
+  } catch (error) {
+    if (error instanceof Tool.UpstreamError) throw error
+    throw new Tool.UpstreamError(describeError(error))
+  }
+  const queryTimeMs = since(start)
 
-  const rdap = yield* Schema.decodeUnknownEffect(RdapDomain)(data).pipe(
-    Effect.mapError((cause) => new Tool.UpstreamError({ message: `Unexpected RDAP response: ${cause.message}`, cause })),
-  )
-  const now = DateTime.toEpochMillis(yield* DateTime.now)
+  if (!isRdapDomain(data)) throw new Tool.UpstreamError("Unexpected RDAP response: the answer does not look like an RDAP domain.")
 
   return {
-    ...summarize(domain, rdap, rdapServer, now),
-    queryTimeMs: Math.round(Duration.toMillis(elapsed)),
+    ...summarize(domain, data, rdapServer, Date.now()),
+    queryTimeMs,
     ...(input.raw ? { raw: data } : {}),
-  } satisfies Result
-})
+  }
+}
 
 // --- Views ----------------------------------------------------------------------
 
@@ -326,7 +344,11 @@ export const rdapLookup = Tool.make<Input, Result>({
   title: "RDAP lookup",
   summary: "Registration data for a domain over RDAP, the successor to WHOIS: registrar, dates, status, nameservers, DNSSEC.",
   category: "DNS & domains",
-  params: Params,
+  params: {
+    domain: { description: "Domain to look up", required: true },
+    raw: { description: "Add the registry's full RDAP response to the JSON (on/off)", default: "off" },
+  },
+  parse,
   run: lookup,
   Form,
   Result,

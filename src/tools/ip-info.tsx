@@ -2,9 +2,9 @@
 // `request.cf`. No geo-IP database, no upstream call. CORS-enabled JSON, so
 // it can stand in for ipinfo.io or ip-api.
 
-import { Effect, Option, Schema, SchemaTransformation } from "effect"
 import { Field, KeyValue, Summary } from "../app/ui.tsx"
 import * as CfData from "../lib/ip-info-cf.ts"
+import { optional } from "../lib/params.ts"
 import * as Tool from "./Tool.ts"
 
 // --- Result ---------------------------------------------------------------------
@@ -48,23 +48,25 @@ export const FIELDS: ReadonlyArray<Field> = [
 ]
 
 /** What the visitor's IP and `cf` say, as one flat record. */
-export const toIpInfo = (ip: Option.Option<string>, cf: Option.Option<CfData.Cf>): IpInfo => {
-  const str = (key: CfData.CfKey) => Option.getOrUndefined(CfData.cfString(cf, key))
-  const asn = Option.getOrUndefined(CfData.cfNumber(cf, "asn"))
+export const toIpInfo = (ip: string | undefined, cf: CfData.Cf): IpInfo => {
+  const str = (key: CfData.CfKey) => CfData.cfString(cf, key)
+  const asn = CfData.cfNumber(cf, "asn")
   const org = str("asOrganization")
-  const loc = Option.zipWith(CfData.cfString(cf, "latitude"), CfData.cfString(cf, "longitude"), (lat, lon) => `${lat},${lon}`)
+  const lat = str("latitude")
+  const lon = str("longitude")
+  const eu = str("isEUCountry")
   return {
-    ip: Option.getOrUndefined(ip),
-    version: Option.getOrUndefined(Option.map(ip, CfData.ipVersion)),
+    ip,
+    version: ip !== undefined ? CfData.ipVersion(ip) : undefined,
     city: str("city"),
     region: str("region"),
     regionCode: str("regionCode"),
     country: str("country"),
     continent: str("continent"),
-    isEU: Option.exists(CfData.cfString(cf, "isEUCountry"), (v) => v === "1" || v === "true"),
+    isEU: eu === "1" || eu === "true",
     postal: str("postalCode"),
     metroCode: str("metroCode"),
-    loc: Option.getOrUndefined(loc),
+    loc: lat !== undefined && lon !== undefined ? `${lat},${lon}` : undefined,
     timezone: str("timezone"),
     asn,
     org: asn !== undefined ? `AS${asn}${org ? ` ${org}` : ""}` : org,
@@ -83,39 +85,24 @@ export const splitFields = (s: string): ReadonlyArray<string> =>
 
 const isField = (f: string): f is Field => (FIELDS as ReadonlyArray<string>).includes(f)
 
+export interface Input {
+  /** A subset of the fields, in the order asked; undefined for all of them. */
+  readonly fields?: ReadonlyArray<Field> | undefined
+}
+
 // `fields=ip,country` picks a subset, like ipinfo.io's field filter.
-const FieldList = Schema.String.pipe(
-  Schema.check(
-    Schema.makeFilter((s: string) => splitFields(s).every(isField), {
-      message: `fields must be a comma-separated list of: ${FIELDS.join(", ")}`,
-    }),
-  ),
-  Schema.decodeTo(
-    Schema.Array(Schema.Literals(FIELDS)),
-    SchemaTransformation.transform({ decode: (s): ReadonlyArray<Field> => splitFields(s).filter(isField), encode: (fs) => fs.join(",") }),
-  ),
-)
+export const parse = (query: Tool.Query): Input => {
+  const raw = optional(query, "fields")
+  if (raw === undefined) return {}
+  const fields = splitFields(raw)
+  if (!fields.every(isField)) throw new Tool.InputError(`fields: expected a comma-separated list of ${FIELDS.join(", ")}`)
+  return { fields }
+}
 
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s)
-
-const Params = Schema.Struct({
-  fields: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({ fields: Schema.optional(FieldList) }),
-    SchemaTransformation.transform({
-      decode: (q): { readonly fields?: string | undefined } => ({ fields: blank(q.fields) }),
-      encode: (i) => i,
-    }),
-  ),
-)
-type Input = typeof Params.Type
-
-const run = Effect.fnUntraced(function*(input: Input) {
-  const visitor = yield* Tool.Visitor
-  const info = toIpInfo(visitor.ip, CfData.decodeCf(visitor.cf))
+export const run = async (input: Input, visitor: Tool.Visitor): Promise<IpInfo> => {
+  const info = toIpInfo(visitor.ip, visitor.cf)
   return input.fields === undefined ? info : pick(info, input.fields)
-})
+}
 
 // --- Views ----------------------------------------------------------------------
 
@@ -176,7 +163,10 @@ export const ipInfo = Tool.make<Input, IpInfo>({
   title: "IP info",
   summary: "Your IP address and where it is: city, country, timezone and network, from Cloudflare's request data.",
   category: "Network",
-  params: Params,
+  params: {
+    fields: { description: `Comma-separated subset of the fields: ${FIELDS.join(", ")}` },
+  },
+  parse,
   autorun: true,
   run,
   Form,

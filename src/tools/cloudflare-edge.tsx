@@ -2,10 +2,10 @@
 // how far it is from the visitor. The colo code and the visitor's location
 // come from `request.cf`; the colo's city and coordinates from a bundled list.
 
-import { Effect, Option, Record, Schema, SchemaTransformation } from "effect"
 import { Field, KeyValue, Status, Summary } from "../app/ui.tsx"
 import data from "../data/colos.json" with { type: "json" }
 import * as CfData from "../lib/ip-info-cf.ts"
+import { optional } from "../lib/params.ts"
 import * as Tool from "./Tool.ts"
 
 // --- Colo data ------------------------------------------------------------------
@@ -24,9 +24,10 @@ export interface Colo {
 const COLOS: Record<string, Omit<Colo, "code">> = data
 export const COLO_COUNT = Object.keys(COLOS).length
 
-export const findColo = (code: string): Option.Option<Colo> => {
+export const findColo = (code: string): Colo | undefined => {
   const upper = code.trim().toUpperCase()
-  return Option.map(Record.get(COLOS, upper), (c) => ({ code: upper, ...c }))
+  const colo = Object.hasOwn(COLOS, upper) ? COLOS[upper] : undefined
+  return colo === undefined ? undefined : { code: upper, ...colo }
 }
 
 export interface Point {
@@ -42,30 +43,22 @@ export const distanceKm = (a: Point, b: Point): number => {
   return 2 * 6371 * Math.asin(Math.sqrt(h))
 }
 
-const pointOf = (c: Colo): Option.Option<Point> =>
-  c.lat !== undefined && c.lon !== undefined ? Option.some({ lat: c.lat, lon: c.lon }) : Option.none()
+const pointOf = (c: Colo): Point | undefined =>
+  c.lat !== undefined && c.lon !== undefined ? { lat: c.lat, lon: c.lon } : undefined
 
 // --- Input ----------------------------------------------------------------------
 
-const ColoCode = Schema.String.pipe(
-  Schema.decode(SchemaTransformation.transform({ decode: (s) => s.trim().toUpperCase(), encode: (s) => s })),
-  Schema.check(Schema.makeFilter((s: string) => /^[A-Z]{3}$/.test(s), { message: "colo must be a three-letter IATA code" })),
-)
+export interface Input {
+  /** A three-letter IATA code, uppercased; undefined for the serving colo. */
+  readonly colo?: string | undefined
+}
 
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s)
-
-const Params = Schema.Struct({
-  colo: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({ colo: Schema.optional(ColoCode) }),
-    SchemaTransformation.transform({
-      decode: (q): { readonly colo?: string | undefined } => ({ colo: blank(q.colo) }),
-      encode: (i) => i,
-    }),
-  ),
-)
-type Input = typeof Params.Type
+export const parse = (query: Tool.Query): Input => {
+  const colo = optional(query, "colo")?.toUpperCase()
+  if (colo === undefined) return {}
+  if (!/^[A-Z]{3}$/.test(colo)) throw new Tool.InputError("colo: expected a three-letter IATA code")
+  return { colo }
+}
 
 // --- Result ---------------------------------------------------------------------
 
@@ -90,43 +83,47 @@ export interface Result {
   readonly distanceKm: number | null
 }
 
-const run = Effect.fnUntraced(function*(input: Input) {
-  const visitor = yield* Tool.Visitor
-  const cf = CfData.decodeCf(visitor.cf)
-  const servedBy = CfData.cfString(cf, "colo").pipe(Option.map((s) => s.toUpperCase()))
+export const run = async (input: Input, visitor: Tool.Visitor): Promise<Result> => {
+  const { cf } = visitor
+  const servedBy = CfData.cfString(cf, "colo")?.toUpperCase()
 
   // A looked-up colo must exist; the serving one may be missing from the list.
-  const looked = yield* Effect.transposeOption(Option.map(Option.fromNullishOr(input.colo), (code) =>
-    Option.match(findColo(code), {
-      onSome: Effect.succeed,
-      onNone: () => Effect.fail(new Tool.InputError({ message: `unknown colo ${code}` })),
-    })))
-  const colo = Option.orElse(looked, () => Option.flatMap(servedBy, findColo))
+  let colo: Colo | undefined
+  if (input.colo !== undefined) {
+    colo = findColo(input.colo)
+    if (colo === undefined) throw new Tool.InputError(`colo: unknown colo ${input.colo}`)
+  } else if (servedBy !== undefined) {
+    colo = findColo(servedBy)
+  }
 
-  const str = (key: CfData.CfKey) => Option.getOrUndefined(CfData.cfString(cf, key))
+  const str = (key: CfData.CfKey) => CfData.cfString(cf, key)
   const lat = CfData.cfNumber(cf, "latitude")
   const lon = CfData.cfNumber(cf, "longitude")
   const country = str("country")
-  const location = Option.map(cf, (): VisitorLocation => ({
+  const fields: VisitorLocation = {
     city: str("city"),
     region: str("region"),
     country,
     countryName: country !== undefined ? CfData.countryName(country) : undefined,
     continent: str("continent"),
-    lat: Option.getOrUndefined(lat),
-    lon: Option.getOrUndefined(lon),
-  }))
-  const here = Option.zipWith(lat, lon, (lat, lon): Point => ({ lat, lon }))
-  const distance = Option.zipWith(Option.flatMap(colo, pointOf), here, (a, b) => Math.round(distanceKm(a, b)))
+    lat,
+    lon,
+  }
+  // Null when request.cf is missing or says nothing about the visitor's location.
+  const location = Object.values(fields).some((v) => v !== undefined) ? fields : null
+  const there = colo !== undefined ? pointOf(colo) : undefined
+  const distance = there !== undefined && lat !== undefined && lon !== undefined
+    ? Math.round(distanceKm(there, { lat, lon }))
+    : null
 
   return {
-    servedBy: Option.getOrNull(servedBy),
-    colo: Option.getOrNull(colo),
-    serving: Option.isSome(colo) && Option.contains(servedBy, colo.value.code),
-    visitor: Option.getOrNull(location),
-    distanceKm: Option.getOrNull(distance),
-  } satisfies Result
-})
+    servedBy: servedBy ?? null,
+    colo: colo ?? null,
+    serving: colo !== undefined && servedBy === colo.code,
+    visitor: location,
+    distanceKm: distance,
+  }
+}
 
 // --- Views ----------------------------------------------------------------------
 
@@ -204,7 +201,10 @@ export const cloudflareEdge = Tool.make<Input, Result>({
   title: "Cloudflare edge",
   summary: "Which Cloudflare data center serves you, where it is and how far away. Or look up any colo code.",
   category: "Network",
-  params: Params,
+  params: {
+    colo: { description: "Three-letter IATA code of a Cloudflare data center; default is the one serving you" },
+  },
+  parse,
   autorun: true,
   run,
   Form,

@@ -1,17 +1,13 @@
-import { ManagedRuntime } from "effect"
-import { FetchHttpClient } from "effect/http"
-import { afterAll, describe, expect, it } from "vitest"
-import { makeHandler } from "../src/app/handler.ts"
-import { rdapLookup } from "../src/tools/rdap-lookup.tsx"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { startWorker, type TestWorker } from "./helpers.ts"
 
-const runtime = ManagedRuntime.make(FetchHttpClient.layer)
-const handle = makeHandler([rdapLookup])
-afterAll(() => runtime.dispose())
+let worker: TestWorker
+beforeAll(async () => {
+  worker = await startWorker({ module: "src/tools/rdap-lookup.tsx", export: "rdapLookup" })
+})
+afterAll(() => worker?.dispose())
 
-const get = async (path: string) => {
-  const response = await runtime.runPromise(handle(new Request(`https://tools.test${path}`)))
-  return { status: response.status, text: await response.text() }
-}
+const get = (path: string) => worker.get(path)
 
 describe("rdap-lookup", () => {
   it("summarises cloudflare.com from Verisign", async () => {
@@ -35,11 +31,11 @@ describe("rdap-lookup", () => {
     expect(body.raw).toMatchObject({ objectClassName: "domain" })
   })
 
-  it("rejects bad input with 400", async () => {
-    for (const q of ["", "domain=", "domain=not%20a%20domain"]) {
+  it("rejects bad input with 400 and names the parameter", async () => {
+    for (const [q, param] of [["", "domain"], ["domain=", "domain"], ["domain=not%20a%20domain", "domain"], ["domain=cloudflare.com&raw=maybe", "raw"]]) {
       const { status, text } = await get(`/rdap-lookup/api?${q}`)
       expect(status, q).toBe(400)
-      expect(JSON.parse(text)).toHaveProperty("error")
+      expect(JSON.parse(text).error, q).toMatch(new RegExp(`^${param}:`))
     }
   })
 

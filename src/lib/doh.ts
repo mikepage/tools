@@ -1,9 +1,7 @@
 // DNS over HTTPS with the JSON API (application/dns-json), from Cloudflare's
 // 1.1.1.1 resolvers or Google's. Shared by the DNS, email and network tools.
 
-import { type Cause, Duration, Effect, Schema } from "effect"
-import { HttpClient, HttpClientResponse } from "effect/http"
-import { UpstreamError } from "../tools/Tool.ts"
+import { getJson, isArrayOf, isRecord, since } from "./http.ts"
 
 export const RESOLVERS = {
   cloudflare: { label: "Cloudflare 1.1.1.1", url: "https://cloudflare-dns.com/dns-query" },
@@ -13,7 +11,6 @@ export const RESOLVERS = {
 } as const
 export type Resolver = keyof typeof RESOLVERS
 export const RESOLVER_NAMES = Object.keys(RESOLVERS) as ReadonlyArray<Resolver>
-export const ResolverParam = Schema.String.pipe(Schema.decodeTo(Schema.Literals(RESOLVER_NAMES)))
 
 /** RCODE -> text. */
 export const DNS_STATUS: Readonly<Record<number, string>> = {
@@ -25,49 +22,55 @@ export const DNS_STATUS: Readonly<Record<number, string>> = {
   5: "Query refused",
 }
 
-export const DohAnswer = Schema.Struct({ name: Schema.String, type: Schema.Number, TTL: Schema.Number, data: Schema.String })
-export type DohAnswer = typeof DohAnswer.Type
+export interface DohAnswer {
+  readonly name: string
+  readonly type: number
+  readonly TTL: number
+  readonly data: string
+}
 
-export const DohResponse = Schema.Struct({
-  Status: Schema.Number,
-  TC: Schema.optional(Schema.Boolean),
-  RD: Schema.optional(Schema.Boolean),
-  RA: Schema.optional(Schema.Boolean),
-  AD: Schema.optional(Schema.Boolean),
-  CD: Schema.optional(Schema.Boolean),
-  Answer: Schema.optional(Schema.Array(DohAnswer)),
-  Authority: Schema.optional(Schema.Array(DohAnswer)),
-})
-export type DohResponse = typeof DohResponse.Type
+export interface DohResponse {
+  readonly Status: number
+  readonly TC?: boolean
+  readonly RD?: boolean
+  readonly RA?: boolean
+  readonly AD?: boolean
+  readonly CD?: boolean
+  readonly Answer?: ReadonlyArray<DohAnswer>
+  readonly Authority?: ReadonlyArray<DohAnswer>
+}
+
+const isAnswer = (v: unknown): v is DohAnswer =>
+  isRecord(v) && typeof v["name"] === "string" && typeof v["type"] === "number" && typeof v["TTL"] === "number" &&
+  typeof v["data"] === "string"
+
+const isResponse = (v: unknown): v is DohResponse =>
+  isRecord(v) && typeof v["Status"] === "number" &&
+  (v["Answer"] === undefined || isArrayOf(v["Answer"], isAnswer)) &&
+  (v["Authority"] === undefined || isArrayOf(v["Authority"], isAnswer))
 
 export interface QueryOptions {
   readonly resolver?: Resolver
   /** true (default) asks for validation (do=1); false disables checking (cd=1). */
   readonly dnssec?: boolean
-  readonly timeout?: Duration.Input
+  /** Milliseconds; default 5000. */
+  readonly timeout?: number
 }
 
-const describe = (cause: { readonly _tag: string; readonly message?: string }): string =>
-  cause._tag === "TimeoutError" ? "the resolver did not answer in time" : cause.message ?? cause._tag
-
-/** One DoH query, with its round-trip time in milliseconds. */
-export const query = Effect.fnUntraced(function*(name: string, type: string, options: QueryOptions = {}) {
-  const client = yield* HttpClient.HttpClient
-  const dnssec = options.dnssec ?? true
-  const [elapsed, response] = yield* client.get(RESOLVERS[options.resolver ?? "cloudflare"].url, {
-    urlParams: { name, type, ...(dnssec ? { do: "1" } : { cd: "1" }) },
+/** One DoH query, with its round-trip time in milliseconds. Throws UpstreamError. */
+export const query = async (name: string, type: string, options: QueryOptions = {}) => {
+  const url = new URL(RESOLVERS[options.resolver ?? "cloudflare"].url)
+  url.searchParams.set("name", name)
+  url.searchParams.set("type", type)
+  url.searchParams.set((options.dnssec ?? true) ? "do" : "cd", "1")
+  const start = performance.now()
+  const response = await getJson(url, isResponse, {
     headers: { accept: "application/dns-json" },
-  }).pipe(
-    Effect.flatMap(HttpClientResponse.filterStatusOk),
-    Effect.flatMap(HttpClientResponse.schemaBodyJson(DohResponse)),
-    Effect.timeout(options.timeout ?? "5 seconds"),
-    Effect.timed,
-    Effect.mapError((cause: { readonly _tag: string; readonly message?: string } | Cause.TimeoutError) =>
-      new UpstreamError({ message: `DNS lookup of ${name} ${type} failed: ${describe(cause)}`, cause })
-    ),
-  )
-  return { response, ms: Math.round(Duration.toMillis(elapsed)) }
-})
+    timeout: options.timeout ?? 5000,
+    what: `DNS lookup of ${name} ${type}`,
+  })
+  return { response, ms: since(start) }
+}
 
 /** The answers of one type, without the CNAME chain that led to them. */
 export const answersOf = (response: DohResponse, typeCode: number): ReadonlyArray<DohAnswer> =>

@@ -1,35 +1,36 @@
-import { ManagedRuntime } from "effect"
-import { FetchHttpClient } from "effect/http"
-import { afterAll, describe, expect, it } from "vitest"
-import { makeHandler } from "../src/app/handler.ts"
-import { dnsDiscovery, subdomainsFromCerts } from "../src/tools/dns-discovery.tsx"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { pool, subdomainsFromCerts } from "../src/tools/dns-discovery.tsx"
+import { startWorker, type TestWorker } from "./helpers.ts"
 
-const runtime = ManagedRuntime.make(FetchHttpClient.layer)
-const handle = makeHandler([dnsDiscovery])
-afterAll(() => runtime.dispose())
+let worker: TestWorker
+beforeAll(async () => {
+  worker = await startWorker({ module: "src/tools/dns-discovery.tsx", export: "dnsDiscovery" })
+})
+afterAll(() => worker?.dispose())
 
-const get = async (path: string) => {
-  const response = await runtime.runPromise(handle(new Request(`https://tools.test${path}`)))
-  return { status: response.status, text: await response.text() }
-}
 const api = async (query: string) => {
-  const { status, text } = await get(`/dns-discovery/api?${query}`)
+  const { status, text } = await worker.get(`/dns-discovery/api?${query}`)
   expect(status, text).toBe(200)
   return JSON.parse(text)
 }
 
 describe("dns-discovery", () => {
-  it("rejects bad input with 400", async () => {
-    for (const q of ["", "domain=nope", "domain=example.com&resolver=quad9"]) {
-      const { status, text } = await get(`/dns-discovery/api?${q}`)
+  it("rejects bad input with 400 and names the parameter", async () => {
+    for (const [q, param] of [["", "domain"], ["domain=nope", "domain"], ["name=nope", "name"], ["domain=example.com&resolver=quad9", "resolver"], ["domain=example.com&ct=maybe", "ct"], ["domain=example.com&dnssec=maybe", "dnssec"]]) {
+      const { status, text } = await worker.get(`/dns-discovery/api?${q}`)
       expect(status, q).toBe(400)
-      expect(JSON.parse(text)).toHaveProperty("error")
+      expect(JSON.parse(text).error, q).toMatch(new RegExp(`^${param}:`))
     }
   })
 
-  it("cleans a pasted URL and keeps the resolver; ct=0 skips CT", async () => {
+  it("cleans a pasted URL and keeps the resolver; ct=0 skips CT", { timeout: 30_000 }, async () => {
     const body = await api(`domain=${encodeURIComponent("https://www.microsoft.com/en-us/")}&ct=0&resolver=google`)
-    expect(body).toMatchObject({ domain: "www.microsoft.com", resolver: "google", ct: null })
+    expect(body).toMatchObject({ domain: "www.microsoft.com", resolver: "google", ct: null, dnssec: null })
+  })
+
+  it("accepts name as an alias for domain", { timeout: 30_000 }, async () => {
+    const body = await api("name=example.com&ct=off")
+    expect(body.domain).toBe("example.com")
   })
 
   it("finds Microsoft 365 records for microsoft.com", { timeout: 30_000 }, async () => {
@@ -55,6 +56,7 @@ describe("dns-discovery", () => {
   it("adds CT data, or a note when crt.sh is down", { timeout: 60_000 }, async () => {
     const body = await api("domain=example.com&ct=1")
     expect(body.ct).toHaveProperty("cached")
+    expect(body.ct.error === undefined || typeof body.ct.error === "string").toBe(true)
   })
 
   it("keeps unexpired, on-domain certificate names only", () => {
@@ -68,8 +70,21 @@ describe("dns-discovery", () => {
     expect(activeCerts).toBe(2)
   })
 
+  it("pool keeps order and caps concurrency", async () => {
+    let inFlight = 0
+    let peak = 0
+    const out = await pool([5, 1, 4, 2, 3], 2, async (n) => {
+      peak = Math.max(peak, ++inFlight)
+      await new Promise((r) => setTimeout(r, n))
+      inFlight--
+      return n * 10
+    })
+    expect(out).toEqual([50, 10, 40, 20, 30])
+    expect(peak).toBe(2)
+  })
+
   it("renders the email checklist and the zone file in the page", { timeout: 30_000 }, async () => {
-    const { status, text } = await get("/dns-discovery?domain=example.com&ct=off")
+    const { status, text } = await worker.get("/dns-discovery?domain=example.com&ct=off")
     expect(status).toBe(200)
     expect(text).toContain("DMARC")
     expect(text).toContain("$ORIGIN example.com.")

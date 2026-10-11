@@ -1,9 +1,9 @@
 // DNS lookup: one record type for a name, over DNS-over-HTTPS.
 
-import { Effect, Schema, SchemaTransformation } from "effect"
 import { Check, Field, KeyValue, Select, Status, Summary, Table } from "../app/ui.tsx"
 import * as Doh from "../lib/doh.ts"
-import { Domain } from "../lib/domain.ts"
+import { domainParam } from "../lib/domain.ts"
+import { flag, oneOf } from "../lib/params.ts"
 import * as Tool from "./Tool.ts"
 
 export const RECORD_TYPES = ["A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "CAA", "SRV", "PTR"] as const
@@ -24,49 +24,20 @@ const TYPE_CODES: Record<RecordType, number> = {
 
 // --- Input ----------------------------------------------------------------------
 
-// `type=mx` works as well as `type=MX`.
-const RecordTypeParam = Schema.String.pipe(
-  Schema.decode(SchemaTransformation.toUpperCase()),
-  Schema.decodeTo(Schema.Literals(RECORD_TYPES)),
-)
+export interface Input {
+  readonly name: string
+  readonly type: RecordType
+  readonly resolver: Doh.Resolver
+  readonly dnssec: boolean
+}
 
-// DNSSEC is on unless the value says otherwise.
-const OnOff = Schema.String.pipe(
-  Schema.decodeTo(
-    Schema.Boolean,
-    SchemaTransformation.transform({ decode: (s) => !/^(false|0|off|no|disabled?)$/i.test(s), encode: String }),
-  ),
-)
-
-// `domain` is accepted as an alias for `name`. An empty field counts as absent.
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s)
-
-const Params = Schema.Struct({
-  name: Schema.optional(Schema.String),
-  domain: Schema.optional(Schema.String),
-  type: Schema.optional(Schema.String),
-  resolver: Schema.optional(Schema.String),
-  dnssec: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({
-      name: Domain,
-      type: RecordTypeParam,
-      resolver: Doh.ResolverParam,
-      dnssec: OnOff,
-    }),
-    SchemaTransformation.transform({
-      decode: (q) => ({
-        name: blank(q.name) ?? blank(q.domain) ?? "",
-        type: blank(q.type) ?? "A",
-        resolver: blank(q.resolver) ?? "cloudflare",
-        dnssec: blank(q.dnssec) ?? "on",
-      }),
-      encode: (i) => i,
-    }),
-  ),
-)
-type Input = typeof Params.Type
+// `domain` is accepted as an alias for `name`, and `type=mx` as `MX`.
+export const parse = (query: Tool.Query): Input => ({
+  name: domainParam(query, ["name", "domain"]),
+  type: oneOf(query, "type", RECORD_TYPES, "A"),
+  resolver: oneOf(query, "resolver", Doh.RESOLVER_NAMES, "cloudflare"),
+  dnssec: flag(query, "dnssec", true),
+})
 
 // --- Result ---------------------------------------------------------------------
 
@@ -131,8 +102,8 @@ export const parseRecord = (type: RecordType, data: string): RecordValue => {
   }
 }
 
-export const lookup = Effect.fnUntraced(function*(input: Input) {
-  const { response, ms } = yield* Doh.query(input.name, input.type, { resolver: input.resolver, dnssec: input.dnssec })
+export const lookup = async (input: Input): Promise<Result> => {
+  const { response, ms } = await Doh.query(input.name, input.type, { resolver: input.resolver, dnssec: input.dnssec })
   return {
     name: input.name,
     type: input.type,
@@ -143,8 +114,8 @@ export const lookup = Effect.fnUntraced(function*(input: Input) {
     dnssec: { enabled: input.dnssec, validated: response.AD === true },
     records: Doh.answersOf(response, TYPE_CODES[input.type]).map((a) => ({ ttl: a.TTL, value: parseRecord(input.type, a.data) })),
     raw: response,
-  } satisfies Result
-})
+  }
+}
 
 // --- Views ----------------------------------------------------------------------
 
@@ -219,7 +190,13 @@ export const dnsLookup = Tool.make<Input, Result>({
   title: "DNS lookup",
   summary: "Look up A, AAAA, MX, TXT and other records over DNS-over-HTTPS, with DNSSEC validation.",
   category: "DNS & domains",
-  params: Params,
+  params: {
+    name: { description: "Domain or DNS name to query (alias: domain)", required: true },
+    type: { description: "Record type", default: "A", values: RECORD_TYPES },
+    resolver: { description: "DNS-over-HTTPS resolver", default: "cloudflare", values: Doh.RESOLVER_NAMES },
+    dnssec: { description: "Ask for DNSSEC validation (on) or disable checking (off)", default: "on" },
+  },
+  parse,
   run: lookup,
   Form,
   Result,

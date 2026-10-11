@@ -1,17 +1,13 @@
-import { ManagedRuntime } from "effect"
-import { FetchHttpClient } from "effect/http"
-import { afterAll, describe, expect, it } from "vitest"
-import { makeHandler } from "../src/app/handler.ts"
-import { ipv6Utils } from "../src/tools/ipv6-utils.tsx"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { startWorker, type TestWorker } from "./helpers.ts"
 
-const runtime = ManagedRuntime.make(FetchHttpClient.layer)
-const handle = makeHandler([ipv6Utils])
-afterAll(() => runtime.dispose())
+let worker: TestWorker
+beforeAll(async () => {
+  worker = await startWorker({ module: "src/tools/ipv6-utils.tsx", export: "ipv6Utils" })
+})
+afterAll(() => worker?.dispose())
 
-const get = async (path: string, headers: Record<string, string> = {}) => {
-  const response = await runtime.runPromise(handle(new Request(`https://tools.test${path}`, { headers })))
-  return { status: response.status, text: await response.text() }
-}
+const get = (path: string, headers: Record<string, string> = {}) => worker.get(path, { headers })
 const api = async (query: string, headers: Record<string, string> = {}) => {
   const { status, text } = await get(`/ipv6-utils/api?${query}`, headers)
   return { status, body: JSON.parse(text) }
@@ -59,17 +55,18 @@ describe("ipv6-utils", () => {
     })
   })
 
-  it("rejects bad input with 400", async () => {
+  it("rejects bad input with 400 and names the parameter", async () => {
     for (const [q, message] of [
-      ["address=1::2::3", "invalid IPv6 address"],
-      ["address=192.168.0.1", "invalid IPv6 address"],
-      ["address=1:2:3:4:5:6:7:8::", "invalid IPv6 address"],
-      ["address=2001:db8::1&prefix=129", "prefix must be an integer 0-128"],
-      ["", "address is required"],
+      ["address=1::2::3", "address: invalid IPv6 address"],
+      ["address=192.168.0.1", "address: invalid IPv6 address"],
+      ["address=1:2:3:4:5:6:7:8::", "address: invalid IPv6 address"],
+      ["address=2001:db8::1&prefix=129", "prefix:"],
+      ["address=2001:db8::1&prefix=1.5", "prefix:"],
+      ["", "address: required"],
     ] as const) {
       const { status, body } = await api(q)
       expect(status, q).toBe(400)
-      expect(body.error, q).toContain(message)
+      expect(body.error.startsWith(message), `${q}: ${body.error}`).toBe(true)
     }
   })
 
@@ -77,7 +74,7 @@ describe("ipv6-utils", () => {
     expect((await api("use=mine", { "cf-connecting-ip": "2a01:4f8::7" })).body.networkAddress).toBe("2a01:4f8::")
     const v4 = await api("use=mine", { "cf-connecting-ip": "192.0.2.1" })
     expect(v4.status).toBe(400)
-    expect(v4.body.error).toContain("No IPv6 address found")
+    expect(v4.body.error).toMatch(/^use: no IPv6 address found.*192\.0\.2\.1/)
   })
 
   it("renders the network in the page", async () => {

@@ -5,57 +5,87 @@ DNS lookup and discovery, DMARC, SPF, RDAP, an SMTP submission test, IPv6,
 browser and IP info, Cloudflare edge and a link scanner.
 
 One Cloudflare Worker. Every tool is a server-rendered page and a JSON API.
-Built on [Effect](https://effect.website), with no compatibility flags and
-one runtime package: `effect`.
+No framework, no runtime dependencies, no compatibility flags. The web
+platform is the standard library.
 
 ## Why
 
-To show that a Worker can host a proper app, and that Effect is a proper
-framework for one. Routing, validation, HTTP clients, timeouts, retries,
-typed errors and services all come from one package with no dependencies of
-its own, released as one version. The previous version of these tools ran
-on Hono and needed 191 packages and `nodejs_compat`.
+These tools started on Deno, moved to Hono (191 packages and
+`nodejs_compat`), then to Effect (one package, but not built or tested for
+workerd). This version uses what the Workers runtime already has:
 
-[`comparison/`](comparison/README.md) has the DNS lookup written three ways:
-for Deno, for Hono with Zod, and with Effect.
+| Need | Platform API |
+| --- | --- |
+| Routing | `URLPattern` |
+| HTTP calls with timeouts | `fetch`, `AbortSignal.timeout` |
+| DNS | DNS over HTTPS, which is `fetch` |
+| HTML parsing | `HTMLRewriter` |
+| SMTP | `connect` from `cloudflare:sockets` |
+| Crypto | `crypto.subtle`, `crypto.randomUUID` |
+| Formatting | `Intl` |
+| Caching, rate limiting | the Cache API, the rate limiting binding |
+
+The Worker is 50 KB gzipped and starts in about 14 ms of CPU. The Effect
+version was 178 KB and about 46 ms.
+
+What the platform doesn't have is small enough to write: input validation
+([`src/lib/params.ts`](src/lib/params.ts)), a JSX runtime that renders HTML
+strings ([`src/jsx/jsx-runtime.ts`](src/jsx/jsx-runtime.ts)), and two error
+classes.
 
 ## How it's built
 
 ```
 src/
-  tools/     one file per tool: input Schema, run Effect, Form and Result views
+  tools/     one file per tool: parse, run, and Form and Result views
   app/       routing, the page layout, components, the stylesheet
-  lib/       shared pieces: DNS over HTTPS, domain input, IP helpers
+  lib/       shared pieces: DNS over HTTPS, fetch with timeouts, input
   jsx/       a JSX runtime that renders to HTML strings
   worker.ts  the Worker entry
+cli/         the `tools` command line
+test/        tests, run inside workerd
 ```
 
 A tool is a value of type `Tool` ([`src/tools/Tool.ts`](src/tools/Tool.ts)):
 
-- `params`: a Schema that decodes the query string into the tool's input.
-  Bad input is a 400 with the Schema's message.
-- `run`: an Effect from input to result. It fails with `InputError` (400) or
-  `UpstreamError` (502), and those types are in its signature.
-- `Form` and `Result`: JSX views.
+- `parse` turns the query string into the tool's input. Bad input throws an
+  `InputError`: a 400 that names the parameter.
+- `run` computes the result. A failing resolver, registry or server throws
+  an `UpstreamError`: a 502. Anything else is a bug: a 500.
+- `params` documents the query parameters.
+- `Form` and `Result` are JSX views.
 
 The app serves `/<slug>` (the page) and `/<slug>/api` (JSON) from the same
-`params` and `run`. There is no client-side JavaScript.
+`parse` and `run`, and `/api.json` lists every tool with its parameters.
+There is no client-side JavaScript.
 
-The JSX runtime ([`src/jsx/jsx-runtime.ts`](src/jsx/jsx-runtime.ts)) is
-about 70 lines. It escapes every interpolated string and has no virtual DOM.
+## Command line
+
+`cli/tools.ts` is built with UnJS [citty](https://github.com/unjs/citty) and
+[consola](https://github.com/unjs/consola). They are the only dependencies,
+and they never reach the Worker. The CLI reads `/api.json` and calls the
+API:
+
+```sh
+npm run cli                                   # list the tools
+npm run cli -- dns-lookup cloudflare.com --type MX
+npm run cli -- dmarc-validator google.com --json
+TOOLS_URL=http://localhost:8787 npm run cli -- ip-info
+```
 
 ## Development
 
 ```sh
 npm install
 npm run dev      # wrangler dev on http://localhost:8787
-npm test         # vitest, through the real handler
+npm test         # vitest, with the Worker running in workerd
 npm run check    # tsc
 npm run deploy
 ```
 
-Tests run in Node against live resolvers and registries. The SMTP test needs
-`cloudflare:sockets`, so its live path only runs on Workers (`npm run dev`).
+Tests start the Worker with Wrangler's test harness, inside workerd, the
+runtime it runs on in production. They use live resolvers, registries and
+mail servers.
 
 ## License
 

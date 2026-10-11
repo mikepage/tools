@@ -6,10 +6,10 @@
 // arrive only after a response has asked for them with `Accept-CH`; the app
 // sets that header (CLIENT_HINTS below) on this tool's responses.
 
-import { Effect, Option, Schema, SchemaTransformation } from "effect"
 import { Check, KeyValue, Status, Summary, Table } from "../app/ui.tsx"
 import * as Ip from "../lib/browserinfo-ip.ts"
 import * as CfData from "../lib/ip-info-cf.ts"
+import { flag } from "../lib/params.ts"
 import * as Tool from "./Tool.ts"
 
 // --- Client Hints (pure) --------------------------------------------------------
@@ -37,9 +37,9 @@ export const parseBrands = (header: string): ReadonlyArray<Brand> =>
 
 // Skip the GREASE entry ("Not;A=Brand", "Not A(Brand") and prefer a real
 // brand over the generic "Chromium".
-const pickBrand = (brands: ReadonlyArray<Brand>): Option.Option<Brand> => {
+const pickBrand = (brands: ReadonlyArray<Brand>): Brand | undefined => {
   const real = brands.filter((b) => !/not.?a.?brand/i.test(b.brand))
-  return Option.fromNullishOr(real.find((b) => b.brand !== "Chromium") ?? real[0])
+  return real.find((b) => b.brand !== "Chromium") ?? real[0]
 }
 
 // Structured-header strings arrive quoted: "macOS".
@@ -58,22 +58,31 @@ export interface ClientHints {
 }
 
 export const clientHints = (headers: Headers): ClientHints => {
-  const header = (name: string) => Option.fromNullishOr(headers.get(name))
+  const header = (name: string) => headers.get(name) ?? undefined
+  const brandOf = (name: string) => {
+    const h = header(name)
+    return h === undefined ? undefined : pickBrand(parseBrands(h))
+  }
   // The full version list is high-entropy and more precise; fall back to Sec-CH-UA.
-  const brand = Option.firstSomeOf([
-    Option.flatMap(header("Sec-CH-UA-Full-Version-List"), (h) => pickBrand(parseBrands(h))),
-    Option.flatMap(header("Sec-CH-UA"), (h) => pickBrand(parseBrands(h))),
-  ])
-  const str = (name: string) => Option.getOrUndefined(header(name).pipe(Option.map(unquote), Option.filter((s) => s !== "")))
+  const brand = brandOf("Sec-CH-UA-Full-Version-List") ?? brandOf("Sec-CH-UA")
+  const str = (name: string) => {
+    const h = header(name)
+    const s = h === undefined ? "" : unquote(h)
+    return s === "" ? undefined : s
+  }
+  const mobile = header("Sec-CH-UA-Mobile")
   return {
-    browser: Option.getOrUndefined(Option.map(brand, (b) => `${b.brand} ${b.version}`)),
+    browser: brand ? `${brand.brand} ${brand.version}` : undefined,
     platform: str("Sec-CH-UA-Platform"),
     platformVersion: str("Sec-CH-UA-Platform-Version"),
-    mobile: Option.getOrUndefined(Option.map(header("Sec-CH-UA-Mobile"), (m) => m.trim() === "?1")),
+    mobile: mobile === undefined ? undefined : mobile.trim() === "?1",
     model: str("Sec-CH-UA-Model"),
     arch: str("Sec-CH-UA-Arch"),
     bitness: str("Sec-CH-UA-Bitness"),
-    raw: Object.fromEntries(CLIENT_HINTS.flatMap((h) => Option.toArray(Option.map(header(h), (v) => [h.toLowerCase(), v])))),
+    raw: Object.fromEntries(CLIENT_HINTS.flatMap((h) => {
+      const v = header(h)
+      return v === undefined ? [] : [[h.toLowerCase(), v]]
+    })),
   }
 }
 
@@ -111,29 +120,12 @@ export const parseUserAgent = (ua: string): { readonly browser?: string; readonl
 
 // --- Input ----------------------------------------------------------------------
 
-// `ptr=false` skips the reverse lookup. The form's checkbox sends on/off.
-const Flag = Schema.String.pipe(
-  Schema.decodeTo(Schema.Literals(["true", "false", "1", "0", "on", "off"])),
-  Schema.decodeTo(
-    Schema.Boolean,
-    SchemaTransformation.transform({ decode: (s) => s === "true" || s === "1" || s === "on", encode: (b) => (b ? "true" : "false") }),
-  ),
-)
+export interface Input {
+  /** Look up the visitor's PTR record; `ptr=off` skips it. */
+  readonly ptr: boolean
+}
 
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s)
-
-const Params = Schema.Struct({
-  ptr: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({ ptr: Flag }),
-    SchemaTransformation.transform({
-      decode: (q) => ({ ptr: blank(q.ptr)?.trim().toLowerCase() ?? "true" }),
-      encode: (i) => i,
-    }),
-  ),
-)
-type Input = typeof Params.Type
+export const parse = (query: Tool.Query): Input => ({ ptr: flag(query, "ptr", true) })
 
 // --- Result ---------------------------------------------------------------------
 
@@ -167,34 +159,34 @@ export interface Result {
   readonly userAgent: { readonly browser?: string; readonly os?: string }
 }
 
-const run = Effect.fnUntraced(function*(input: Input) {
-  const visitor = yield* Tool.Visitor
-  const cf = CfData.decodeCf(visitor.cf)
+const definedEntries = (pairs: ReadonlyArray<readonly [string, string | undefined]>): Record<string, string> =>
+  Object.fromEntries(pairs.filter((p): p is readonly [string, string] => p[1] !== undefined))
+
+export const run = async (input: Input, visitor: Tool.Visitor): Promise<Result> => {
+  const { ip, cf } = visitor
 
   // A failed lookup does not fail the whole answer: it is reported next to it.
-  const lookup = visitor.ip.pipe(
-    Option.filter((ip) => input.ptr && !Ip.isPrivate(ip)),
-    Option.flatMap((ip) => Option.map(Ip.reverseName(ip), (name) => Ip.ptr(ip, name))),
-  )
-  const ptr = yield* Option.match(lookup, {
-    onNone: () => Effect.succeed({ ptr: null }),
-    onSome: (effect) =>
-      effect.pipe(
-        Effect.map((ptr) => ({ ptr })),
-        Effect.catchTag("UpstreamError", (e) => Effect.succeed({ ptr: null, ptrError: e.message })),
-      ),
-  })
+  const name = ip !== undefined && input.ptr && !Ip.isPrivate(ip) ? Ip.reverseName(ip) : undefined
+  let ptr: Pick<Result, "ptr" | "ptrError"> = { ptr: null }
+  if (ip !== undefined && name !== undefined) {
+    try {
+      ptr = { ptr: await Ip.ptr(ip, name) }
+    } catch (e) {
+      if (!(e instanceof Tool.UpstreamError)) throw e
+      ptr = { ptr: null, ptrError: e.message }
+    }
+  }
 
   return {
-    ip: Option.getOrUndefined(visitor.ip),
-    version: Option.getOrUndefined(Option.map(visitor.ip, CfData.ipVersion)),
+    ip,
+    version: ip !== undefined ? CfData.ipVersion(ip) : undefined,
     ...ptr,
-    cf: Object.fromEntries(CF_KEYS.flatMap((k) => Option.toArray(Option.map(CfData.cfString(cf, k), (v) => [k, v])))),
-    headers: Object.fromEntries(HEADERS.flatMap((h) => Option.toArray(Option.map(Option.fromNullishOr(visitor.headers.get(h)), (v) => [h, v])))),
+    cf: definedEntries(CF_KEYS.map((k) => [k, CfData.cfString(cf, k)])),
+    headers: definedEntries(HEADERS.map((h) => [h, visitor.headers.get(h) ?? undefined])),
     clientHints: clientHints(visitor.headers),
     userAgent: parseUserAgent(visitor.headers.get("user-agent") ?? ""),
-  } satisfies Result
-})
+  }
+}
 
 // --- Views ----------------------------------------------------------------------
 
@@ -284,7 +276,10 @@ export const browserinfo = Tool.make<Input, Result>({
   title: "Browser info",
   summary: "What a server sees of your request: headers, Client Hints, location, TLS and your IP with its reverse DNS.",
   category: "Network",
-  params: Params,
+  params: {
+    ptr: { description: "Look up the reverse DNS (PTR) of your IP; off skips it", default: "on" },
+  },
+  parse,
   autorun: true,
   run,
   Form,

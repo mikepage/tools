@@ -1,19 +1,21 @@
-import { ManagedRuntime, Option } from "effect"
-import { FetchHttpClient } from "effect/http"
-import { afterAll, describe, expect, it } from "vitest"
-import { makeHandler } from "../src/app/handler.ts"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { isPrivate, reverseName } from "../src/lib/browserinfo-ip.ts"
-import { browserinfo, parseUserAgent } from "../src/tools/browserinfo.tsx"
+import { parseUserAgent } from "../src/tools/browserinfo.tsx"
+import { startWorker, type TestWorker } from "./helpers.ts"
 
-const runtime = ManagedRuntime.make(FetchHttpClient.layer)
-const handle = makeHandler([browserinfo])
-afterAll(() => runtime.dispose())
+let worker: TestWorker
+beforeAll(async () => {
+  worker = await startWorker({ module: "src/tools/browserinfo.tsx", export: "browserinfo" })
+})
+afterAll(() => worker?.dispose())
 
-const get = async (path: string, headers: Record<string, string> = {}, cf?: Record<string, unknown>) => {
-  const request = Object.assign(new Request(`https://tools.test${path}`, { headers }), cf ? { cf } : {})
-  const response = await runtime.runPromise(handle(request))
-  return { status: response.status, text: await response.text() }
-}
+const get = (path: string, headers: Record<string, string> = {}, cf?: Record<string, unknown>) =>
+  worker.get(path, { headers, ...(cf ? { cf } : {}) })
+// The harness always fills request.cf with a fallback and merges what a test
+// passes over it; null clears a field, as if it were missing.
+const NO_CF = Object.fromEntries(
+  ["colo", "country", "city", "region", "postalCode", "timezone", "asn", "asOrganization", "httpProtocol", "tlsVersion", "tlsCipher"].map((k) => [k, null]),
+)
 const json = async (path: string, headers: Record<string, string> = {}) => JSON.parse((await get(path, headers)).text)
 
 describe("browserinfo", () => {
@@ -29,6 +31,11 @@ describe("browserinfo", () => {
       ptr: null,
       headers: { "user-agent": "flareosaur-check", "accept-language": "nl-NL" },
     })
+  })
+
+  it("asks for Client Hints on the response", async () => {
+    const { headers } = await get("/browserinfo/api?ptr=off")
+    expect(headers.get("accept-ch")).toContain("Sec-CH-UA-Full-Version-List")
   })
 
   it("reads Sec-CH-UA, skipping GREASE and preferring a real brand", async () => {
@@ -48,10 +55,10 @@ describe("browserinfo", () => {
     expect(body.clientHints).toMatchObject({ browser: "Chromium 132.0.6834.83", mobile: true })
   })
 
-  it("rejects a bad ptr flag with 400", async () => {
+  it("rejects a bad ptr flag with 400 and names the parameter", async () => {
     const { status, text } = await get("/browserinfo/api?ptr=maybe")
     expect(status).toBe(400)
-    expect(JSON.parse(text)).toHaveProperty("error")
+    expect(JSON.parse(text).error).toMatch(/^ptr:/)
   })
 
   it("looks up the PTR of a public IP", async () => {
@@ -59,15 +66,21 @@ describe("browserinfo", () => {
     expect(body.ptr).toMatchObject({ name: "1.1.1.1.in-addr.arpa", hostname: "one.one.one.one" })
   })
 
+  it("reads request.cf when it is there", async () => {
+    const cf = { colo: "AMS", country: "NL", city: "Amsterdam", httpProtocol: "HTTP/3", tlsVersion: "TLSv1.3", asn: 1136, botManagement: { score: 1 } }
+    const body = JSON.parse((await get("/browserinfo/api?ptr=off", { "cf-connecting-ip": "203.0.113.5" }, cf)).text)
+    expect(body.cf).toMatchObject({ colo: "AMS", country: "NL", city: "Amsterdam", asn: "1136", httpProtocol: "HTTP/3", tlsVersion: "TLSv1.3" })
+  })
+
   it("builds reverse names and rejects non-addresses", () => {
-    expect(Option.getOrNull(reverseName("2606:4700:4700::1111"))).toBe(
+    expect(reverseName("2606:4700:4700::1111")).toBe(
       "1.1.1.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.7.4.0.0.7.4.6.0.6.2.ip6.arpa",
     )
-    expect(Option.getOrNull(reverseName("::ffff:192.0.2.1"))).toBe(
+    expect(reverseName("::ffff:192.0.2.1")).toBe(
       "1.0.2.0.0.0.0.c.f.f.f.f.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
     )
     for (const bad of ["example.com", "300.1.1.1", "01.1.1.1", "2001:db8:::1", "fe80::1%eth0", "::ffff:999.0.0.1", ""]) {
-      expect(Option.isNone(reverseName(bad)), bad).toBe(true)
+      expect(reverseName(bad), bad).toBeUndefined()
     }
     expect(isPrivate("100.64.0.1")).toBe(true)
     expect(isPrivate("fd00::1")).toBe(true)
@@ -96,5 +109,13 @@ describe("browserinfo", () => {
     expect(text).toContain("Netherlands (NL)")
     expect(text).toContain("not looked up")
     expect(text).toContain("None received")
+  })
+
+  it("renders the page without cf data, skipping PTR for a private address", async () => {
+    const { status, text } = await get("/browserinfo", { "cf-connecting-ip": "10.0.0.1" }, NO_CF)
+    expect(status).toBe(200)
+    expect(text).toContain("private address, not looked up")
+    expect(text).toContain("No request.cf data")
+    expect(JSON.parse((await get("/browserinfo/api?ptr=off", {}, NO_CF)).text).cf).toEqual({})
   })
 })

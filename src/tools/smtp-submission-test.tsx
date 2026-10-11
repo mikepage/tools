@@ -1,54 +1,41 @@
 // SMTP submission test: a mail server's submission port over raw TCP. Reads
 // the banner, sends EHLO, upgrades with STARTTLS when offered (implicit TLS on
 // 465), sends EHLO again and returns the capabilities with the transcript.
-//
-// `cloudflare:sockets` is imported inside the Effect, so this module loads in
-// Node too (for tests of the validation and the SSRF guard).
 
-import { Clock, Duration, Effect, Schema, SchemaTransformation } from "effect"
+import { connect } from "cloudflare:sockets"
 import { Field, type Level, Select, Status, Summary, Table } from "../app/ui.tsx"
 import * as Doh from "../lib/doh.ts"
 import { isDomain } from "../lib/domain.ts"
+import { optional, required } from "../lib/params.ts"
+import { capabilitiesOf, isPrivateAddress } from "../lib/smtp-submission-test.ts"
 import * as Tool from "./Tool.ts"
 
 export const PORTS = [587, 465, 2525] as const
-const TIMEOUT = Duration.seconds(8)
+export type SubmissionPort = (typeof PORTS)[number]
+/** Milliseconds for each step: DNS, connect, handshake, each reply. */
+const TIMEOUT = 8000
 const EHLO_NAME = "tools.mikepage.nl"
 
 // --- Input ----------------------------------------------------------------------
 
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s)
+export interface Input {
+  readonly host: string
+  readonly port: SubmissionPort
+}
 
-// IP literals are refused: a literal would skip the DNS check below.
-const Host = Schema.String.pipe(
-  Schema.decode(SchemaTransformation.transform({ decode: (s) => s.trim().toLowerCase().replace(/\.$/, ""), encode: (s) => s })),
-  Schema.check(
-    Schema.makeFilter((host: string) =>
-      /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":")
-        ? "IP addresses are not accepted, enter a hostname"
-        : isDomain(host) || "invalid hostname"
-    ),
-  ),
-)
-
-// Port 25 is not on the list: Workers cannot open it.
-const Port = Schema.FiniteFromString.pipe(
-  Schema.check(Schema.makeFilter((p: number) => (PORTS as ReadonlyArray<number>).includes(p) || "port must be 587, 465, or 2525")),
-)
-
-const Params = Schema.Struct({
-  host: Schema.optional(Schema.String),
-  port: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({ host: Host, port: Port }),
-    SchemaTransformation.transform({
-      decode: (q) => ({ host: blank(q.host) ?? "", port: blank(q.port) ?? "587" }),
-      encode: (i) => i,
-    }),
-  ),
-)
-type Input = typeof Params.Type
+export const parse = (query: Tool.Query): Input => {
+  const host = required(query, "host", "smtp.example.com").toLowerCase().replace(/\.$/, "")
+  // IP literals are refused: a literal would skip the DNS check below.
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":")) {
+    throw new Tool.InputError("host: IP addresses are not accepted, enter a hostname")
+  }
+  if (!isDomain(host)) throw new Tool.InputError("host: expected a hostname such as smtp.example.com")
+  // Port 25 is not on the list: Workers cannot open it.
+  const raw = optional(query, "port") ?? "587"
+  const port = PORTS.find((p) => String(p) === raw)
+  if (port === undefined) throw new Tool.InputError("port: expected 587, 465 or 2525")
+  return { host, port }
+}
 
 // --- Result ---------------------------------------------------------------------
 
@@ -79,67 +66,44 @@ export interface Result {
 // link-local and reserved ranges. Resolving just before the connect narrows
 // the window for DNS rebinding.
 
-export const isPrivateIPv4 = (ip: string): boolean => {
-  const p = ip.split(".").map(Number)
-  if (p.length !== 4 || p.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true
-  const [a = 0, b = 0, c = 0] = p
-  return a === 0 || a === 10 || a === 127 || // this host, private, loopback
-    (a === 100 && b >= 64 && b <= 127) || // CGNAT
-    (a === 169 && b === 254) || // link-local
-    (a === 172 && b >= 16 && b <= 31) || // private
-    (a === 192 && b === 168) || // private
-    (a === 192 && b === 0 && (c === 0 || c === 2)) || // IETF protocol assignments, TEST-NET-1
-    (a === 198 && (b === 18 || b === 19)) || // benchmarking
-    (a === 198 && b === 51 && c === 100) || // TEST-NET-2
-    (a === 203 && b === 0 && c === 113) || // TEST-NET-3
-    a >= 224 // multicast, reserved, broadcast
+const addresses = async (host: string, type: "A" | "AAAA"): Promise<ReadonlyArray<string>> => {
+  const { response } = await Doh.query(host, type, { timeout: TIMEOUT })
+  return Doh.answersOf(response, type === "A" ? 1 : 28).map((a) => a.data)
 }
 
-export const isPrivateIPv6 = (ip: string): boolean => {
-  const h = ip.toLowerCase()
-  if (h === "::1" || h === "::") return true
-  if (/^fe[89ab]/.test(h)) return true // fe80::/10 link-local
-  if (h.startsWith("fc") || h.startsWith("fd")) return true // fc00::/7 unique local
-  if (h.startsWith("ff")) return true // multicast
-  if (h.startsWith("2001:db8:") || h.startsWith("2001:0db8:")) return true // documentation
-  const mapped = h.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/) // IPv4-mapped
-  return mapped ? isPrivateIPv4(mapped[1]!) : false
-}
-
-export const isPrivateAddress = (ip: string): boolean => (ip.includes(":") ? isPrivateIPv6(ip) : isPrivateIPv4(ip))
-
-const addresses = (host: string, type: "A" | "AAAA") =>
-  Doh.query(host, type, { timeout: TIMEOUT }).pipe(
-    Effect.map(({ response }) => Doh.answersOf(response, type === "A" ? 1 : 28).map((a) => a.data)),
-  )
-
-export const assertPublicHost = Effect.fnUntraced(function*(host: string) {
-  const [a, aaaa] = yield* Effect.all([addresses(host, "A"), addresses(host, "AAAA")], { concurrency: 2 })
+export const assertPublicHost = async (host: string): Promise<void> => {
+  const [a, aaaa] = await Promise.all([addresses(host, "A"), addresses(host, "AAAA")])
   const all = [...a, ...aaaa]
-  if (all.length === 0) return yield* new Tool.InputError({ message: `${host} does not resolve to any address.` })
-  if (all.some(isPrivateAddress)) {
-    return yield* new Tool.InputError({ message: `${host} resolves to a private or reserved address.` })
-  }
-})
+  if (all.length === 0) throw new Tool.InputError(`host: ${host} does not resolve to any address.`)
+  if (all.some(isPrivateAddress)) throw new Tool.InputError(`host: ${host} resolves to a private or reserved address.`)
+}
 
 // --- The SMTP session -----------------------------------------------------------
 
 /** Something went wrong on the connection; the probe reports it as its result. */
-class SmtpError extends Schema.TaggedError<SmtpError>()("SmtpError", { message: Schema.String }) {}
+class SmtpError extends Error {
+  override readonly name = "SmtpError"
+}
 
-type Log = (direction: LogEntry["direction"], message: string) => Effect.Effect<void>
+type Log = (direction: LogEntry["direction"], message: string) => void
 
 const reason = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
-// Runs `effect` with the probe's timeout; a timeout is an SmtpError too.
-const timed = <A, E>(effect: Effect.Effect<A, E>, what: string) =>
-  Effect.timeoutOrElse(effect, {
-    duration: TIMEOUT,
-    orElse: () => Effect.fail(new SmtpError({ message: `${what} timed out after ${Duration.toSeconds(TIMEOUT)} s` })),
+/** Settles with `promise`, or fails with an SmtpError after TIMEOUT. */
+const timed = async <A,>(promise: Promise<A>, what: string): Promise<A> => {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new SmtpError(`${what} timed out after ${TIMEOUT / 1000} s`)), TIMEOUT)
   })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 const awaitOpened = (socket: Socket, what: string) =>
-  timed(Effect.tryPromise({ try: () => socket.opened, catch: (e) => new SmtpError({ message: `${what} failed: ${reason(e)}` }) }), what)
+  timed(socket.opened.catch((e: unknown) => Promise.reject(new SmtpError(`${what} failed: ${reason(e)}`))), what)
 
 // A line-oriented SMTP session over one socket (one per TLS layer), logging
 // every line both ways.
@@ -151,60 +115,56 @@ const session = (socket: Socket, log: Log) => {
   let buf = ""
 
   // Reads reply lines until the final "NNN " line (a space, not a dash).
-  const read = (what: string) =>
-    timed(
-      Effect.gen(function*() {
-        const lines: Array<string> = []
-        while (true) {
-          let i: number
-          while ((i = buf.indexOf("\r\n")) !== -1) {
-            const line = buf.slice(0, i)
-            buf = buf.slice(i + 2)
-            lines.push(line)
-            yield* log("received", line)
-            if (/^\d{3}( |$)/.test(line)) return lines
-          }
-          const { value, done } = yield* Effect.tryPromise({
-            try: () => reader.read(),
-            catch: (e) => new SmtpError({ message: `read failed: ${reason(e)}` }),
-          })
-          if (done) return yield* new SmtpError({ message: `connection closed while waiting for ${what}` })
-          buf += decoder.decode(value, { stream: true })
-        }
-      }),
-      what,
-    )
+  const readLines = async (what: string): Promise<Array<string>> => {
+    const lines: Array<string> = []
+    while (true) {
+      let i: number
+      while ((i = buf.indexOf("\r\n")) !== -1) {
+        const line = buf.slice(0, i)
+        buf = buf.slice(i + 2)
+        lines.push(line)
+        log("received", line)
+        if (/^\d{3}( |$)/.test(line)) return lines
+      }
+      let chunk: ReadableStreamReadResult<Uint8Array>
+      try {
+        chunk = await reader.read()
+      } catch (e) {
+        throw new SmtpError(`read failed: ${reason(e)}`)
+      }
+      if (chunk.done) throw new SmtpError(`connection closed while waiting for ${what}`)
+      buf += decoder.decode(chunk.value, { stream: true })
+    }
+  }
 
-  const send = (line: string) =>
-    log("sent", line).pipe(
-      Effect.andThen(Effect.tryPromise({
-        try: () => writer.write(encoder.encode(`${line}\r\n`)),
-        catch: (e) => new SmtpError({ message: `write failed: ${reason(e)}` }),
-      })),
-    )
+  const read = (what: string) => timed(readLines(what), what)
+
+  const send = async (line: string): Promise<void> => {
+    log("sent", line)
+    try {
+      await timed(writer.write(encoder.encode(`${line}\r\n`)), `sending ${line.split(" ")[0]}`)
+    } catch (e) {
+      throw e instanceof SmtpError ? e : new SmtpError(`write failed: ${reason(e)}`)
+    }
+  }
 
   // Hands the socket back, before startTls() takes it over.
-  const release = Effect.sync(() => {
+  const release = () => {
     reader.releaseLock()
     writer.releaseLock()
-  })
+  }
 
   return { read, send, release }
 }
 
-/** The first EHLO line is "250-hostname greeting"; the rest are capabilities. */
-export const capabilitiesOf = (lines: ReadonlyArray<string>): Array<string> =>
-  lines.slice(1).filter((l) => l.startsWith("250")).map((l) => l.slice(4).trim()).filter(Boolean)
-
 const hasCapability = (caps: ReadonlyArray<string>, name: string) => caps.some((c) => c.toUpperCase().split(" ")[0] === name)
 
-export const probe = Effect.fnUntraced(function*(host: string, port: number) {
-  const started = yield* Clock.currentTimeMillis
+export const probe = async (host: string, port: number): Promise<Result> => {
+  const started = Date.now()
   const logs: Array<LogEntry> = []
-  const log: Log = (direction, message) =>
-    Effect.map(Clock.currentTimeMillis, (now) => {
-      logs.push({ t: now - started, direction, message })
-    })
+  const log: Log = (direction, message) => {
+    logs.push({ t: Date.now() - started, direction, message })
+  }
   const implicit = port === 465
   const result: { -readonly [K in keyof Result]: Result[K] } = {
     success: false,
@@ -216,70 +176,59 @@ export const probe = Effect.fnUntraced(function*(host: string, port: number) {
     logs,
   }
 
-  // Imported here so the module loads outside the Workers runtime.
-  const { connect } = yield* Effect.tryPromise({
-    try: () => import("cloudflare:sockets"),
-    catch: () => new Tool.UpstreamError({ message: "TCP sockets are only available on Cloudflare Workers." }),
-  })
+  // `socket` follows the STARTTLS upgrade, which replaces it; the finally
+  // closes whichever is current, whatever happened.
+  let socket: Socket | undefined
+  try {
+    log("info", `Connecting to ${host}:${port}${implicit ? " with implicit TLS" : ""}`)
+    try {
+      socket = connect({ hostname: host, port }, { secureTransport: implicit ? "on" : "starttls", allowHalfOpen: false })
+    } catch (e) {
+      throw new SmtpError(`connect failed: ${reason(e)}`)
+    }
+    await awaitOpened(socket, "TCP connect")
+    log("info", implicit ? "Connected, TLS handshake done" : "Connected")
+    let s = session(socket, log)
 
-  const conversation = Effect.gen(function*() {
-    yield* log("info", `Connecting to ${host}:${port}${implicit ? " with implicit TLS" : ""}`)
-    // The socket is a resource: whatever happens below (a failure, a timeout,
-    // an interruption), the scope closes it. `current` follows the STARTTLS
-    // upgrade, which replaces the socket.
-    const conn = yield* Effect.acquireRelease(
-      Effect.try({
-        try: () => ({
-          current: connect({ hostname: host, port }, { secureTransport: implicit ? "on" : "starttls", allowHalfOpen: false }),
-        }),
-        catch: (e) => new SmtpError({ message: `connect failed: ${reason(e)}` }),
-      }),
-      (conn) => Effect.promise(() => conn.current.close().catch(() => {})),
-    )
-    yield* awaitOpened(conn.current, "TCP connect")
-    yield* log("info", implicit ? "Connected, TLS handshake done" : "Connected")
-    let s = session(conn.current, log)
-
-    result.greeting = (yield* s.read("greeting")).join("\n")
-    yield* s.send(`EHLO ${EHLO_NAME}`)
-    result.capabilities = capabilitiesOf(yield* s.read("EHLO reply"))
+    result.greeting = (await s.read("greeting")).join("\n")
+    await s.send(`EHLO ${EHLO_NAME}`)
+    result.capabilities = capabilitiesOf(await s.read("EHLO reply"))
 
     if (!implicit && hasCapability(result.capabilities, "STARTTLS")) {
-      yield* s.send("STARTTLS")
-      const [reply = ""] = yield* s.read("STARTTLS reply")
-      if (!reply.startsWith("220")) return yield* new SmtpError({ message: `STARTTLS rejected: ${reply}` })
-      yield* log("info", "Upgrading to TLS")
-      yield* s.release
-      conn.current = conn.current.startTls({ expectedServerHostname: host })
-      yield* awaitOpened(conn.current, "TLS handshake")
-      yield* log("info", "TLS handshake done")
-      s = session(conn.current, log)
+      await s.send("STARTTLS")
+      const [reply = ""] = await s.read("STARTTLS reply")
+      if (!reply.startsWith("220")) throw new SmtpError(`STARTTLS rejected: ${reply}`)
+      log("info", "Upgrading to TLS")
+      s.release()
+      socket = socket.startTls({ expectedServerHostname: host })
+      await awaitOpened(socket, "TLS handshake")
+      log("info", "TLS handshake done")
+      s = session(socket, log)
       result.tlsUpgraded = true
       result.plaintextCapabilities = result.capabilities
       // Servers often advertise different capabilities (typically AUTH) once TLS is up.
-      yield* s.send(`EHLO ${EHLO_NAME}`)
-      result.capabilities = capabilitiesOf(yield* s.read("EHLO reply after TLS"))
+      await s.send(`EHLO ${EHLO_NAME}`)
+      result.capabilities = capabilitiesOf(await s.read("EHLO reply after TLS"))
     }
 
-    yield* s.send("QUIT")
-    yield* Effect.ignore(s.read("QUIT reply"))
+    await s.send("QUIT")
+    await s.read("QUIT reply").catch(() => undefined)
     result.success = true
-  }).pipe(Effect.scoped)
+  } catch (error) {
+    // A failed probe is still a result: the transcript shows where it broke.
+    if (!(error instanceof SmtpError)) throw error
+    result.error = error.message
+    log("error", error.message)
+  } finally {
+    await socket?.close().catch(() => undefined)
+  }
+  return result
+}
 
-  // A failed probe is still a result: the transcript shows where it broke.
-  yield* conversation.pipe(
-    Effect.catchTag("SmtpError", (error) => {
-      result.error = error.message
-      return log("error", error.message)
-    }),
-  )
-  return result as Result
-})
-
-export const test = Effect.fnUntraced(function*(input: Input) {
-  yield* assertPublicHost(input.host)
-  return yield* probe(input.host, input.port)
-})
+export const test = async (input: Input): Promise<Result> => {
+  await assertPublicHost(input.host)
+  return probe(input.host, input.port)
+}
 
 // --- Views ----------------------------------------------------------------------
 
@@ -385,7 +334,11 @@ export const smtpSubmissionTest = Tool.make<Input, Result>({
   title: "SMTP submission test",
   summary: "Connect to a mail server's submission port and check its banner, STARTTLS and login options.",
   category: "Email",
-  params: Params,
+  params: {
+    host: { description: "Mail server hostname; IP addresses and hosts that resolve to private ranges are refused", required: true },
+    port: { description: "Submission port: 587 and 2525 use STARTTLS, 465 implicit TLS", default: "587", values: PORTS.map(String) },
+  },
+  parse,
   run: test,
   Form,
   Result,

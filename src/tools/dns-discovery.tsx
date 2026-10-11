@@ -4,11 +4,11 @@
 // logs (crt.sh) are probed too; that lookup is cached for an hour and
 // degrades to a note when crt.sh is down.
 
-import { Array as Arr, DateTime, Duration, Effect, Order, Schedule, Schema, SchemaTransformation } from "effect"
-import { HttpClient } from "effect/http"
 import { Check, Field, type Level, Select, Status, Summary, Table } from "../app/ui.tsx"
 import * as Doh from "../lib/doh.ts"
-import { Domain } from "../lib/domain.ts"
+import { domainParam } from "../lib/domain.ts"
+import { isArrayOf, isRecord, since } from "../lib/http.ts"
+import { flag, oneOf } from "../lib/params.ts"
 import * as Tool from "./Tool.ts"
 
 // --- What gets probed -----------------------------------------------------------
@@ -48,32 +48,21 @@ const staticProbes = (): Array<Probe> => [
 
 // --- Input ----------------------------------------------------------------------
 
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s)
-const isOn = (s: string) => /^(1|true|on|yes)$/i.test(s)
+export interface Input {
+  readonly domain: string
+  readonly resolver: Doh.Resolver
+  readonly dnssec: boolean
+  readonly ct: boolean
+}
 
 // `name` is accepted as an alias for `domain`. DNSSEC is off unless asked
 // for; CT is on unless switched off. The form's checkboxes send `on`/`off`.
-const Params = Schema.Struct({
-  domain: Schema.optional(Schema.String),
-  name: Schema.optional(Schema.String),
-  resolver: Schema.optional(Schema.String),
-  dnssec: Schema.optional(Schema.String),
-  ct: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({ domain: Domain, resolver: Doh.ResolverParam, dnssec: Schema.Boolean, ct: Schema.Boolean }),
-    SchemaTransformation.transform({
-      decode: (q) => ({
-        domain: blank(q.domain) ?? blank(q.name) ?? "",
-        resolver: blank(q.resolver) ?? "cloudflare",
-        dnssec: isOn(blank(q.dnssec) ?? "0"),
-        ct: isOn(blank(q.ct) ?? "1"),
-      }),
-      encode: (i) => ({ domain: i.domain, resolver: i.resolver, dnssec: i.dnssec ? "1" : "0", ct: i.ct ? "1" : "0" }),
-    }),
-  ),
-)
-type Input = typeof Params.Type
+export const parse = (query: Tool.Query): Input => ({
+  domain: domainParam(query, ["domain", "name"]),
+  resolver: oneOf(query, "resolver", Doh.RESOLVER_NAMES, "cloudflare"),
+  dnssec: flag(query, "dnssec", false),
+  ct: flag(query, "ct", true),
+})
 
 // --- Result ---------------------------------------------------------------------
 
@@ -163,58 +152,84 @@ interface Answered {
 // One probe -> the records at exactly that name: the queried type, or the
 // CNAME the name aliases. A probe that fails just finds nothing: one bad name
 // must not sink a scan of a hundred.
-const runProbe = (domain: string, probe: Probe, input: Input) => {
+const runProbe = async (domain: string, probe: Probe, input: Input): Promise<Answered> => {
   const fqdn = probe.label === "@" ? domain : `${probe.label}.${domain}`
-  return Doh.query(fqdn, probe.type, { resolver: input.resolver, dnssec: input.dnssec }).pipe(
-    Effect.map(({ response }): Answered => ({
+  try {
+    const { response } = await Doh.query(fqdn, probe.type, { resolver: input.resolver, dnssec: input.dnssec })
+    return {
       probe,
       rows: (response.Answer ?? [])
         .filter((a) => Doh.noDot(a.name).toLowerCase() === fqdn && (typeName(a.type) === probe.type || a.type === 5))
         .map((a) => ({ name: probe.label, type: typeName(a.type), ttl: a.TTL, ...formatValue(typeName(a.type), a.data) })),
       ad: response.AD === true,
-    })),
-    Effect.orElseSucceed((): Answered => ({ probe, rows: [], ad: false })),
-  )
+    }
+  } catch {
+    return { probe, rows: [], ad: false }
+  }
 }
+
+/** Maps `items` with at most `limit` calls in flight; results keep the input order. */
+export const pool = async <T, R>(items: ReadonlyArray<T>, limit: number, f: (item: T) => Promise<R>): Promise<Array<R>> => {
+  const results = new Array<R>(items.length)
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++
+      results[i] = await f(items[i]!)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return results
+}
+
+const dedupe = <T,>(xs: ReadonlyArray<T>): Array<T> => [...new Set(xs)]
 
 // --- Wildcards ------------------------------------------------------------------
 
 // Resolve a random label: anything that answers is a wildcard, and its values
 // mark false positives among the other probes.
-const detectWildcard = Effect.fnUntraced(function*(input: Input) {
-  const label = `wc-probe-${(yield* Effect.sync(() => crypto.randomUUID())).slice(0, 12)}`
-  const answers = yield* Effect.forEach(
-    WILDCARD_TYPES,
-    (type) => runProbe(input.domain, { label, type, group: "subdomains" }, input),
-    { concurrency: "unbounded" },
+const detectWildcard = async (input: Input): Promise<Wildcard | null> => {
+  const label = `wc-probe-${crypto.randomUUID().slice(0, 12)}`
+  const answers = await Promise.all(
+    WILDCARD_TYPES.map((type) => runProbe(input.domain, { label, type, group: "subdomains" }, input)),
   )
   const rows = answers.flatMap((a) => a.rows)
   if (rows.length === 0) return null
   return {
     cname: rows.find((r) => r.type === "CNAME")?.value ?? null,
-    targets: Arr.dedupe(rows.map((r) => r.value)),
-  } satisfies Wildcard
-})
+    targets: dedupe(rows.map((r) => r.value)),
+  }
+}
 
 // --- Certificate Transparency (crt.sh) ------------------------------------------
 
-const CrtShEntries = Schema.Array(Schema.Struct({ name_value: Schema.String, not_after: Schema.String }))
-type CrtShEntry = (typeof CrtShEntries.Type)[number]
+export interface CrtShEntry {
+  readonly name_value: string
+  readonly not_after: string
+}
+
+const isCrtShEntry = (v: unknown): v is CrtShEntry =>
+  isRecord(v) && typeof v["name_value"] === "string" && typeof v["not_after"] === "string"
 
 // What gets cached: the parsed summary, not crt.sh's (often huge) response.
-const CtSummary = Schema.Struct({
-  subdomains: Schema.Array(Schema.String),
-  totalCerts: Schema.Number,
-  activeCerts: Schema.Number,
-})
-type CtSummary = typeof CtSummary.Type
+interface CtSummary {
+  readonly subdomains: ReadonlyArray<string>
+  readonly totalCerts: number
+  readonly activeCerts: number
+}
 
-class CrtShError extends Schema.TaggedError<CrtShError>()("CrtShError", {
-  message: Schema.String,
+const isCtSummary = (v: unknown): v is CtSummary =>
+  isRecord(v) && isArrayOf(v["subdomains"], (x): x is string => typeof x === "string") &&
+  typeof v["totalCerts"] === "number" && typeof v["activeCerts"] === "number"
+
+/** A crt.sh failure; its message ends up in the result's `ct.error`. */
+class CrtShError extends Error {
+  override readonly name = "CrtShError"
   /** Set when crt.sh answered with a 5xx: worth one retry. */
-  status: Schema.optional(Schema.Number),
-  cause: Schema.optional(Schema.Defect()),
-}) {}
+  constructor(message: string, readonly status?: number) {
+    super(message)
+  }
+}
 
 /** Unexpired certificates -> unique subdomain labels (no wildcards, no apex, nothing off-domain). */
 export const subdomainsFromCerts = (
@@ -235,66 +250,88 @@ export const subdomainsFromCerts = (
       if (/^[a-z0-9_]([a-z0-9_.-]*[a-z0-9])?$/.test(sub)) found.add(sub)
     }
   }
-  return { subdomains: Arr.sort([...found], Order.String), activeCerts: active.length }
+  return { subdomains: [...found].sort(), activeCerts: active.length }
 }
 
-const CRTSH_TIMEOUT = Duration.seconds(10)
+const CRTSH_TIMEOUT_MS = 10_000
+
+const isTimeout = (error: unknown) => error instanceof DOMException && error.name === "TimeoutError"
+
+// One request with its own timeout, covering the body too.
+const fetchCrtSh = async (url: URL): Promise<string> => {
+  const signal = AbortSignal.timeout(CRTSH_TIMEOUT_MS)
+  let response: Response
+  try {
+    response = await fetch(url, { headers: { "user-agent": "tools.mikepage.nl dns-discovery" }, signal })
+  } catch (error) {
+    throw new CrtShError(isTimeout(error) ? `crt.sh did not answer within ${CRTSH_TIMEOUT_MS / 1000}s` : "crt.sh could not be reached")
+  }
+  if (response.status >= 500) {
+    await response.body?.cancel()
+    throw new CrtShError(`crt.sh answered HTTP ${response.status}`, response.status)
+  }
+  if (response.status !== 200) {
+    await response.body?.cancel()
+    throw new CrtShError(`crt.sh answered HTTP ${response.status}`)
+  }
+  try {
+    return await response.text()
+  } catch {
+    throw new CrtShError("crt.sh response could not be read")
+  }
+}
 
 // crt.sh is slow and sheds load with 502/503s: a timeout per attempt, and one
 // retry on a 5xx (not on a timeout: that would double the wait).
-const fetchCtSummary = Effect.fnUntraced(function*(domain: string) {
-  const client = yield* HttpClient.HttpClient
-  const response = yield* client.get("https://crt.sh/", {
-    urlParams: { q: `%.${domain}`, output: "json" },
-    headers: { "user-agent": "tools.mikepage.nl dns-discovery" },
-  }).pipe(
-    Effect.timeout(CRTSH_TIMEOUT),
-    Effect.mapError((cause) =>
-      new CrtShError({
-        message: cause._tag === "TimeoutError" ? `crt.sh did not answer within ${Duration.toSeconds(CRTSH_TIMEOUT)}s` : "crt.sh could not be reached",
-        cause,
-      })
-    ),
-    Effect.filterOrFail(
-      (r) => r.status < 500,
-      (r) => new CrtShError({ message: `crt.sh answered HTTP ${r.status}`, status: r.status }),
-    ),
-    Effect.retry({ times: 1, while: (e) => e.status !== undefined, schedule: Schedule.spaced("200 millis") }),
-  )
-  if (response.status !== 200) return yield* new CrtShError({ message: `crt.sh answered HTTP ${response.status}` })
-  const text = yield* response.text.pipe(
-    Effect.timeout(CRTSH_TIMEOUT),
-    Effect.mapError((cause) => new CrtShError({ message: "crt.sh response could not be read", cause })),
-  )
-  const entries = text.trim() === "" ? [] : yield* Schema.decodeUnknownEffect(Schema.fromJsonString(CrtShEntries))(text).pipe(
-    Effect.mapError((cause) => new CrtShError({ message: "crt.sh returned an unreadable response", cause })),
-  )
-  const now = DateTime.toEpochMillis(yield* DateTime.now)
-  return { ...subdomainsFromCerts(domain, entries, now), totalCerts: entries.length } satisfies CtSummary
-})
+const fetchCtSummary = async (domain: string): Promise<CtSummary> => {
+  const url = new URL("https://crt.sh/")
+  url.searchParams.set("q", `%.${domain}`)
+  url.searchParams.set("output", "json")
+  let text: string
+  try {
+    text = await fetchCrtSh(url)
+  } catch (error) {
+    if (!(error instanceof CrtShError) || error.status === undefined) throw error
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    text = await fetchCrtSh(url)
+  }
+  let entries: unknown = []
+  if (text.trim() !== "") {
+    try {
+      entries = JSON.parse(text)
+    } catch {
+      entries = undefined
+    }
+  }
+  if (!isArrayOf(entries, isCrtShEntry)) throw new CrtShError("crt.sh returned an unreadable response")
+  return { ...subdomainsFromCerts(domain, entries, Date.now()), totalCerts: entries.length }
+}
 
-// The Workers Cache API, when there is one (not in Node tests). The key is
-// synthetic: it is never fetched, only used to address the entry. Any cache
-// trouble just means a miss.
-const cache = (): Cache | undefined => (typeof caches === "undefined" ? undefined : (caches as unknown as { default: Cache }).default)
+// The Workers Cache API. The key is synthetic: it is never fetched, only used
+// to address the entry. Any cache trouble just means a miss. The cast is for
+// the DOM lib's CacheStorage type, which lacks Workers' `default`.
+const cache = (): Cache => (caches as unknown as { readonly default: Cache }).default
 const cacheKey = (domain: string) => new Request(`https://crtsh.cache.tools.invalid/v1/${encodeURIComponent(domain)}`)
 
-const cacheGet = (domain: string) =>
-  Effect.gen(function*() {
-    const store = cache()
-    if (!store) return undefined
-    const hit = yield* Effect.tryPromise(() => store.match(cacheKey(domain)))
+const cacheGet = async (domain: string): Promise<CtSummary | undefined> => {
+  try {
+    const hit = await cache().match(cacheKey(domain))
     if (!hit) return undefined
-    return yield* Effect.tryPromise(() => hit.json()).pipe(Effect.flatMap(Schema.decodeUnknownEffect(CtSummary)))
-  }).pipe(Effect.orElseSucceed(() => undefined))
+    const body: unknown = await hit.json()
+    return isCtSummary(body) ? body : undefined
+  } catch {
+    return undefined
+  }
+}
 
-const cachePut = (domain: string, summary: CtSummary) =>
-  Effect.gen(function*() {
-    const store = cache()
-    if (!store) return
+const cachePut = async (domain: string, summary: CtSummary): Promise<void> => {
+  try {
     const response = Response.json(summary, { headers: { "cache-control": "public, max-age=3600" } })
-    yield* Effect.tryPromise(() => store.put(cacheKey(domain), response))
-  }).pipe(Effect.ignore)
+    await cache().put(cacheKey(domain), response)
+  } catch {
+    // A failed write only costs a refetch next time.
+  }
+}
 
 interface CtResult extends CtSummary {
   readonly cached: boolean
@@ -302,44 +339,39 @@ interface CtResult extends CtSummary {
 }
 
 // Failures never reach the client as errors: they come back in `error`.
-const ctSubdomains = (domain: string): Effect.Effect<CtResult, never, HttpClient.HttpClient> =>
-  Effect.gen(function*() {
-    const hit = yield* cacheGet(domain)
-    if (hit) return { ...hit, cached: true }
-    const summary = yield* fetchCtSummary(domain)
-    yield* cachePut(domain, summary)
+const ctSubdomains = async (domain: string): Promise<CtResult> => {
+  const hit = await cacheGet(domain)
+  if (hit) return { ...hit, cached: true }
+  try {
+    const summary = await fetchCtSummary(domain)
+    await cachePut(domain, summary)
     return { ...summary, cached: false }
-  }).pipe(
-    Effect.catchTag("CrtShError", (e) =>
-      Effect.succeed<CtResult>({ subdomains: [], totalCerts: 0, activeCerts: 0, cached: false, error: e.message })),
-  )
+  } catch (error) {
+    if (!(error instanceof CrtShError)) throw error
+    return { subdomains: [], totalCerts: 0, activeCerts: 0, cached: false, error: error.message }
+  }
+}
 
 // --- The scan -------------------------------------------------------------------
 
-const byNameThenType: Order.Order<Row> = Order.combine(
-  Order.mapInput(Order.String, (r: Row) => r.name),
-  Order.mapInput(Order.String, (r: Row) => r.type),
-)
+const byNameThenType = (a: Row, b: Row): number =>
+  a.name < b.name ? -1 : a.name > b.name ? 1 : a.type < b.type ? -1 : a.type > b.type ? 1 : 0
 
-export const discover = Effect.fnUntraced(function*(input: Input) {
+export const discover = async (input: Input): Promise<Result> => {
   const { domain } = input
-  const scannedAt = DateTime.formatIso(yield* DateTime.now)
+  const scannedAt = new Date().toISOString()
+  const start = performance.now()
   // crt.sh first (it feeds the probe list), with wildcard detection alongside.
-  const [elapsed, { answered, probes, fromCt, wildcard, ctData }] = yield* Effect.timed(Effect.gen(function*() {
-    const [ctData, wildcard] = yield* Effect.all(
-      [input.ct ? ctSubdomains(domain) : Effect.succeed(null), detectWildcard(input)],
-      { concurrency: "unbounded" },
-    )
-    const probes = staticProbes()
-    const known = new Set(probes.map((p) => p.label))
-    const fromCt = (ctData?.subdomains ?? []).filter((s) => !known.has(s))
-    for (const label of fromCt.slice(0, CT_MAX)) {
-      probes.push({ label, type: "A", group: "subdomains" }, { label, type: "AAAA", group: "subdomains" })
-    }
-    // The fan-out: every probe, at most CONCURRENCY in flight.
-    const answered = yield* Effect.forEach(probes, (p) => runProbe(domain, p, input), { concurrency: CONCURRENCY })
-    return { answered, probes, fromCt, wildcard, ctData }
-  }))
+  const [ctData, wildcard] = await Promise.all([input.ct ? ctSubdomains(domain) : null, detectWildcard(input)])
+  const probes = staticProbes()
+  const known = new Set(probes.map((p) => p.label))
+  const fromCt = (ctData?.subdomains ?? []).filter((s) => !known.has(s))
+  for (const label of fromCt.slice(0, CT_MAX)) {
+    probes.push({ label, type: "A", group: "subdomains" }, { label, type: "AAAA", group: "subdomains" })
+  }
+  // The fan-out: every probe, at most CONCURRENCY in flight.
+  const answered = await pool(probes, CONCURRENCY, (p) => runProbe(domain, p, input))
+  const queryTimeMs = since(start)
 
   // Values the random label also resolves to only exist because of the
   // wildcard. Duplicate rows (a CNAME seen from both the A and AAAA probe)
@@ -356,14 +388,14 @@ export const discover = Effect.fnUntraced(function*(input: Input) {
       groups[probe.group].push(r)
     }
   }
-  groups.subdomains = Arr.sort(groups.subdomains, byNameThenType)
+  groups.subdomains.sort(byNameThenType)
 
   const fetchedCrt = ctData != null && !ctData.cached && ctData.error === undefined
   return {
     domain,
     resolver: input.resolver,
     scannedAt,
-    queryTimeMs: Math.round(Duration.toMillis(elapsed)),
+    queryTimeMs,
     subrequests: probes.length + WILDCARD_TYPES.length + (fetchedCrt ? 1 : 0),
     total: groups.apex.length + groups.email.length + groups.subdomains.length,
     dnssec: input.dnssec ? { validated: answered.some((a) => a.ad) } : null,
@@ -377,8 +409,8 @@ export const discover = Effect.fnUntraced(function*(input: Input) {
       ...(ctData.error === undefined ? {} : { error: ctData.error }),
     },
     ...groups,
-  } satisfies Result
-})
+  }
+}
 
 // --- Reading the result ---------------------------------------------------------
 
@@ -397,7 +429,7 @@ export const emailSetup = (r: Result): ReadonlyArray<Finding> => {
   const spf = txtAt(r, "@", /^v=spf1\b/i)
   const dmarc = txtAt(r, "_dmarc", /^v=DMARC1\b/i)
   const policy = /\bp=(\w+)/i.exec(dmarc[0]?.value ?? "")?.[1]?.toLowerCase()
-  const dkim = Arr.dedupe(
+  const dkim = dedupe(
     r.email.filter((row) => row.name.endsWith("._domainkey") && (row.type === "CNAME" || /\bp=/.test(row.value)))
       .map((row) => row.name.replace(/\._domainkey$/, "")),
   )
@@ -450,7 +482,8 @@ export const zoneFile = (r: Result): string => {
 
 // --- Views ----------------------------------------------------------------------
 
-const flag = (value: string | undefined, fallback: boolean) => (value === undefined || value === "" ? fallback : isOn(value))
+const checked = (value: string | undefined, fallback: boolean) =>
+  value === undefined || value === "" ? fallback : /^(1|true|on|yes)$/i.test(value)
 
 const Form = ({ query }: { readonly query: Tool.Query }) => (
   <>
@@ -461,8 +494,8 @@ const Form = ({ query }: { readonly query: Tool.Query }) => (
       value={query["resolver"] ?? "cloudflare"}
       options={Doh.RESOLVER_NAMES.map((r) => [r, Doh.RESOLVERS[r].label])}
     />
-    <Check label="CT logs" name="ct" checked={flag(query["ct"], true)} />
-    <Check label="DNSSEC" name="dnssec" checked={flag(query["dnssec"], false)} />
+    <Check label="CT logs" name="ct" checked={checked(query["ct"], true)} />
+    <Check label="DNSSEC" name="dnssec" checked={checked(query["dnssec"], false)} />
   </>
 )
 
@@ -484,7 +517,7 @@ const Records = (props: { readonly rows: ReadonlyArray<Row>; readonly empty: str
     )
 
 const Result = ({ result }: { readonly result: Result }) => {
-  const names = Arr.dedupe(result.subdomains.map((r) => r.name))
+  const names = dedupe(result.subdomains.map((r) => r.name))
   return (
     <>
       <Summary
@@ -541,7 +574,13 @@ export const dnsDiscovery = Tool.make<Input, Result>({
   title: "DNS discovery",
   summary: "Scan a domain's apex records, email setup and subdomains in one go, with names from Certificate Transparency logs.",
   category: "DNS & domains",
-  params: Params,
+  params: {
+    domain: { description: "Domain to scan (alias: name)", required: true },
+    resolver: { description: "DNS-over-HTTPS resolver", default: "cloudflare", values: Doh.RESOLVER_NAMES },
+    dnssec: { description: "Ask for DNSSEC validation (on) or skip it (off)", default: "off" },
+    ct: { description: "Also probe names from Certificate Transparency logs (crt.sh)", default: "on" },
+  },
+  parse,
   run: discover,
   Form,
   Result,

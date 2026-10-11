@@ -1,5 +1,0 @@
-{
-  "name": "dns-lookup-hono",
-  "main": "src/index.tsx",
-  "compatibility_date": "2026-09-30"
-}

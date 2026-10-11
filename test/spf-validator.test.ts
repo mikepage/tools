@@ -1,17 +1,13 @@
-import { ManagedRuntime } from "effect"
-import { FetchHttpClient } from "effect/http"
-import { afterAll, describe, expect, it } from "vitest"
-import { makeHandler } from "../src/app/handler.ts"
-import { spfValidator } from "../src/tools/spf-validator.tsx"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { startWorker, type TestWorker } from "./helpers.ts"
 
-const runtime = ManagedRuntime.make(FetchHttpClient.layer)
-const handle = makeHandler([spfValidator])
-afterAll(() => runtime.dispose())
+let worker: TestWorker
+beforeAll(async () => {
+  worker = await startWorker({ module: "src/tools/spf-validator.tsx", export: "spfValidator" })
+})
+afterAll(() => worker?.dispose())
 
-const get = async (path: string) => {
-  const response = await runtime.runPromise(handle(new Request(`https://tools.test${path}`)))
-  return { status: response.status, text: await response.text() }
-}
+const get = (path: string) => worker.get(path)
 /** Evaluates a draft record for example.com. */
 const draft = async (record: string) =>
   JSON.parse((await get(`/spf-validator/api?domain=example.com&record=${encodeURIComponent(record)}`)).text)
@@ -71,11 +67,17 @@ describe("spf-validator", () => {
     expect(texts(body)).toContain("Too many DNS lookups: 12")
   })
 
-  it("rejects bad input with 400", async () => {
-    for (const q of ["", "domain=localhost", "domain=google.com&resolver=nope", `domain=example.com&record=${"a".repeat(4097)}`]) {
+  it("rejects bad input with 400 and names the parameter", async () => {
+    const cases: Array<[string, string]> = [
+      ["", "domain"],
+      ["domain=localhost", "domain"],
+      ["domain=google.com&resolver=nope", "resolver"],
+      [`domain=example.com&record=${"a".repeat(4097)}`, "record"],
+    ]
+    for (const [q, param] of cases) {
       const { status, text } = await get(`/spf-validator/api?${q}`)
       expect(status, q.slice(0, 40)).toBe(400)
-      expect(JSON.parse(text)).toHaveProperty("error")
+      expect(JSON.parse(text).error, q.slice(0, 40)).toMatch(new RegExp(`^${param}:`))
     }
   })
 

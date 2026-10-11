@@ -1,5 +1,5 @@
-// @mikepage/tools: the tools as a library. Each tool exports its engine
-// (`params` + `run`) and its views; the Worker in worker.ts serves them.
+// @mikepage/tools: the tools as a library. Each tool exports its `parse`,
+// `run` and views; the Worker in worker.ts serves them.
 
 export * as Tool from "./tools/Tool.ts"
 export { tools } from "./tools/index.ts"

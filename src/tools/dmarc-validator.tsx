@@ -1,15 +1,13 @@
 // DMARC validator: a domain's _dmarc TXT record, checked for common mistakes,
 // with every tag explained.
 
-import { Effect, Schema, SchemaTransformation } from "effect"
 import { Field, type Level, Select, Status, Summary, Table } from "../app/ui.tsx"
 import * as Doh from "../lib/doh.ts"
-import { cleanDomain, Domain } from "../lib/domain.ts"
+import { cleanDomain, isDomain } from "../lib/domain.ts"
+import { oneOf, required } from "../lib/params.ts"
 import * as Tool from "./Tool.ts"
 
 // --- Input ----------------------------------------------------------------------
-
-const blank = (s: string | undefined) => (s === undefined || s.trim() === "" ? undefined : s)
 
 /** People paste `_dmarc.example.com`; the tool adds the prefix itself. */
 export const stripDmarc = (input: string): string => {
@@ -17,22 +15,16 @@ export const stripDmarc = (input: string): string => {
   return d.startsWith("_dmarc.") ? d.slice("_dmarc.".length) : d
 }
 
-const Params = Schema.Struct({
-  domain: Schema.optional(Schema.String),
-  resolver: Schema.optional(Schema.String),
-}).pipe(
-  Schema.decodeTo(
-    Schema.Struct({ domain: Domain, resolver: Doh.ResolverParam }),
-    SchemaTransformation.transform({
-      decode: (q) => ({
-        domain: stripDmarc(blank(q.domain) ?? ""),
-        resolver: blank(q.resolver) ?? "cloudflare",
-      }),
-      encode: (i) => i,
-    }),
-  ),
-)
-type Input = typeof Params.Type
+export interface Input {
+  readonly domain: string
+  readonly resolver: Doh.Resolver
+}
+
+export const parse = (query: Tool.Query): Input => {
+  const domain = stripDmarc(required(query, "domain", "example.com"))
+  if (!isDomain(domain)) throw new Tool.InputError("domain: expected a domain such as example.com")
+  return { domain, resolver: oneOf(query, "resolver", Doh.RESOLVER_NAMES, "cloudflare") }
+}
 
 // --- Result ---------------------------------------------------------------------
 
@@ -167,8 +159,8 @@ export const policyDescription = (policy: string): string => {
 
 // --- The tool -------------------------------------------------------------------
 
-export const checkDmarc = Effect.fnUntraced(function*(input: Input) {
-  const { response, ms } = yield* Doh.query(`_dmarc.${input.domain}`, "TXT", { resolver: input.resolver })
+export const checkDmarc = async (input: Input): Promise<Result> => {
+  const { response, ms } = await Doh.query(`_dmarc.${input.domain}`, "TXT", { resolver: input.resolver })
   // NXDOMAIN on _dmarc only means there is no record; anything else is a DNS problem.
   const dnsError = response.Status !== 0 && response.Status !== 3
     ? Doh.DNS_STATUS[response.Status] ?? `DNS error ${response.Status}`
@@ -189,8 +181,8 @@ export const checkDmarc = Effect.fnUntraced(function*(input: Input) {
     queryTime: ms,
     status: response.Status,
     dnsError,
-  } satisfies Result
-})
+  }
+}
 
 // --- Views ----------------------------------------------------------------------
 
@@ -255,7 +247,11 @@ export const dmarcValidator = Tool.make<Input, Result>({
   title: "DMARC validator",
   summary: "Fetch a domain's DMARC record, explain every tag and flag common mistakes.",
   category: "Email",
-  params: Params,
+  params: {
+    domain: { description: "Domain to check; a pasted _dmarc. prefix or URL is cleaned up", required: true },
+    resolver: { description: "DNS-over-HTTPS resolver", default: "cloudflare", values: Doh.RESOLVER_NAMES },
+  },
+  parse,
   run: checkDmarc,
   Form,
   Result,
