@@ -1,0 +1,13 @@
+{
+  "name": "dns-lookup-hono",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "wrangler dev" },
+  "dependencies": {
+    "hono": "4.13.11",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "wrangler": "4.149.0"
+  }
+}

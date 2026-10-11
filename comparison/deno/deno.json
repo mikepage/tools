@@ -1,0 +1,5 @@
+{
+  "imports": {
+    "@std/html": "jsr:@std/html@1.0.5"
+  }
+}
