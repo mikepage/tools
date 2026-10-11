@@ -2,12 +2,11 @@
 
 Network and email tools at [tools.mikepage.nl](https://tools.mikepage.nl):
 DNS lookup and discovery, DMARC, SPF, RDAP, an SMTP submission test, IPv6,
-browser and IP info, Cloudflare edge, a link scanner and a phone number
-validator.
+browser and IP info, Cloudflare edge and a link scanner.
 
 One Cloudflare Worker. Every tool is a server-rendered page and a JSON API.
 Built on [Effect](https://effect.website), with no compatibility flags and
-two runtime packages: `effect`, and `libphonenumber-js` for the phone tool.
+one runtime package: `effect`.
 
 ## Why
 

@@ -6,7 +6,6 @@ import { dmarcValidator } from "./dmarc-validator.tsx"
 import { dnsDiscovery } from "./dns-discovery.tsx"
 import { dnsLookup } from "./dns-lookup.tsx"
 import { externalLinkScanner } from "./external-link-scanner.tsx"
-import { intlTelValidate } from "./intl-tel-validate.tsx"
 import { ipInfo } from "./ip-info.tsx"
 import { ipv6Utils } from "./ipv6-utils.tsx"
 import { rdapLookup } from "./rdap-lookup.tsx"
@@ -21,7 +20,6 @@ export const tools: ReadonlyArray<AnyTool> = [
   dnsDiscovery,
   dnsLookup,
   externalLinkScanner,
-  intlTelValidate,
   ipInfo,
   ipv6Utils,
   rdapLookup,
