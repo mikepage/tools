@@ -2,3 +2,6 @@ node_modules/
 .wrangler/
 .claude/
 .test-build/
+.void-wrangler.jsonc
+dist/
+.void/

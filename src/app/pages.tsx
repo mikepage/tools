@@ -11,8 +11,8 @@ export const Home = (props: { readonly tools: ReadonlyArray<AnyTool> }): Html =>
   <Layout title="tools" description="Network and email tools: DNS, DMARC, SPF, RDAP, SMTP, IPv6 and more.">
     <h1>tools</h1>
     <p class="lede">
-      Network and email tools. Every tool is a page and a JSON API, in one Cloudflare Worker, built on Effect. One
-      runtime dependency, no compatibility flags. <a href="https://github.com/mikepage/tools">How it's built</a>
+      Network and email tools. Every tool is a page and a JSON API, in one Cloudflare Worker, built with Void on
+      the web platform. <a href="https://github.com/mikepage/tools">How it's built</a>
     </p>
     {CATEGORIES.map((category) => {
       const list = props.tools.filter((t) => t.category === category)

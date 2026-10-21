@@ -1,9 +1,12 @@
-// Routing and running, with URLPattern. Every tool gets:
+// Running and responding. Every tool gets:
 //
 //   GET /<slug>       the page: the form, and the result when there is a query
 //   GET /<slug>/api   the same run as JSON: the result, or { error } with 400/502
 //
 // GET /api.json lists the tools and their parameters (the CLI reads it).
+//
+// The Void routes in routes/ call these one by one. `makeHandler` puts them
+// behind URLPattern for a Worker of its own, which the per-tool tests use.
 
 import type { Html } from "../jsx/jsx-runtime.ts"
 import { type AnyTool, InputError, type Query, UpstreamError, type Visitor, visitorFrom } from "../tools/Tool.ts"
@@ -43,6 +46,48 @@ const withHeaders = (response: Response, headers: Readonly<Record<string, string
   return response
 }
 
+const queryOf = (request: Request): Query => Object.fromEntries(new URL(request.url).searchParams)
+
+export const homePage = (tools: ReadonlyArray<AnyTool>): Response => html(Home({ tools }))
+
+export const notFoundPage = (): Response => html(NotFound(), 404)
+
+export const stylesheet = (): Response =>
+  new Response(css, {
+    headers: { "content-type": "text/css; charset=utf-8", "cache-control": "public, max-age=31536000, immutable" },
+  })
+
+export const catalog = (tools: ReadonlyArray<AnyTool>): Response =>
+  json(
+    tools.map((t) => ({
+      slug: t.slug,
+      title: t.title,
+      summary: t.summary,
+      category: t.category,
+      params: t.params,
+      api: `/${t.slug}/api`,
+    })),
+  )
+
+/** GET /<slug>/api: the run as JSON. */
+export const toolApi = async (tool: AnyTool, request: Request): Promise<Response> => {
+  const run = await runTool(tool, queryOf(request), visitorFrom(request))
+  return withHeaders(run.ok ? json(run.result) : json({ error: run.message }, run.status), tool.responseHeaders)
+}
+
+/** GET /<slug>: the form, and the result when there is a query. */
+export const toolPage = async (tool: AnyTool, request: Request): Promise<Response> => {
+  const query = queryOf(request)
+  let outcome: Outcome = { _tag: "Empty" }
+  let status = 200
+  if (Object.keys(query).length > 0 || tool.autorun) {
+    const run = await runTool(tool, query, visitorFrom(request))
+    outcome = run.ok ? { _tag: "Done", input: run.input, result: run.result } : { _tag: "Failed", message: run.message }
+    status = run.ok ? 200 : run.status
+  }
+  return withHeaders(html(ToolPage({ tool, query, outcome }), status), tool.responseHeaders)
+}
+
 const HOME = new URLPattern({ pathname: "/" })
 const STYLES = new URLPattern({ pathname: "/styles.css" })
 const CATALOG = new URLPattern({ pathname: "/api.json" })
@@ -53,26 +98,12 @@ const SLASHED = new URLPattern({ pathname: "/:slug/" })
 export const makeHandler = (tools: ReadonlyArray<AnyTool>) => {
   const bySlug = new Map(tools.map((t) => [t.slug, t]))
 
-  const catalog = () =>
-    tools.map((t) => ({
-      slug: t.slug,
-      title: t.title,
-      summary: t.summary,
-      category: t.category,
-      params: t.params,
-      api: `/${t.slug}/api`,
-    }))
-
   return async (request: Request): Promise<Response> => {
     if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed", { status: 405 })
     const url = new URL(request.url)
-    if (HOME.test(url)) return html(Home({ tools }))
-    if (STYLES.test(url)) {
-      return new Response(css, {
-        headers: { "content-type": "text/css; charset=utf-8", "cache-control": "public, max-age=31536000, immutable" },
-      })
-    }
-    if (CATALOG.test(url)) return json(catalog())
+    if (HOME.test(url)) return homePage(tools)
+    if (STYLES.test(url)) return stylesheet()
+    if (CATALOG.test(url)) return catalog(tools)
 
     const slashed = SLASHED.exec(url)
     if (slashed && bySlug.has(slashed.pathname.groups["slug"]!)) {
@@ -82,23 +113,7 @@ export const makeHandler = (tools: ReadonlyArray<AnyTool>) => {
     const api = API.exec(url)
     const page = PAGE.exec(url)
     const tool = bySlug.get((api ?? page)?.pathname.groups["slug"] ?? "")
-    if (!tool) return html(NotFound(), 404)
-
-    const query: Query = Object.fromEntries(url.searchParams)
-    const visitor = visitorFrom(request)
-
-    if (api) {
-      const run = await runTool(tool, query, visitor)
-      return withHeaders(run.ok ? json(run.result) : json({ error: run.message }, run.status), tool.responseHeaders)
-    }
-
-    let outcome: Outcome = { _tag: "Empty" }
-    let status = 200
-    if (Object.keys(query).length > 0 || tool.autorun) {
-      const run = await runTool(tool, query, visitor)
-      outcome = run.ok ? { _tag: "Done", input: run.input, result: run.result } : { _tag: "Failed", message: run.message }
-      status = run.ok ? 200 : run.status
-    }
-    return withHeaders(html(ToolPage({ tool, query, outcome }), status), tool.responseHeaders)
+    if (!tool) return notFoundPage()
+    return api ? toolApi(tool, request) : toolPage(tool, request)
   }
 }

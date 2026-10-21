@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Network and email tools on Cloudflare Workers, built on the web platform with no runtime dependencies.",
+  "description": "Network and email tools on Cloudflare Workers, built with Void on the web platform.",
   "license": "MIT",
   "exports": {
     ".": "./src/mod.ts",
@@ -11,11 +11,12 @@
     "./jsx-dev-runtime": "./src/jsx/jsx-runtime.ts"
   },
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "dev": "vite dev",
+    "deploy": "void deploy",
     "check": "tsc --noEmit && tsc --noEmit -p cli",
     "test": "vitest run",
-    "cli": "node cli/tools.ts"
+    "cli": "node cli/tools.ts",
+    "build": "vite build"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261010.1",
@@ -23,16 +24,16 @@
     "esbuild": "0.28.2",
     "miniflare": "5.20261006.1-alpha",
     "typescript": "6.0.3",
+    "vite": "8.3.5",
     "vitest": "4.1.11",
+    "void": "1.1.12",
     "wrangler": "4.149.0"
   },
   "allowScripts": {
     "esbuild@0.28.2": true,
-    "workerd@1.20261006.1": true
-  },
-  "dependencies": {
-    "citty": "0.2.2",
-    "consola": "3.4.2"
+    "workerd@1.20261006.1": true,
+    "workerd@1.20261012.1": true,
+    "workerd@1.20261019.1": true
   },
   "bin": {
     "tools": "./cli/tools.ts"

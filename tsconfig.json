@@ -18,5 +18,5 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src", "test", "scripts"]
+  "include": ["src", "test", "scripts", "routes", "middleware", "void.config.ts", "vite.config.ts", "vitest.config.ts"]
 }

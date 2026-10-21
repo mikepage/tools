@@ -26,3 +26,8 @@ export const tools: ReadonlyArray<AnyTool> = [
   smtpSubmissionTest,
   spfValidator,
 ].sort((a, b) => a.title.localeCompare(b.title))
+
+const bySlug = new Map(tools.map((t) => [t.slug, t]))
+
+/** The tool at /<slug>, if there is one. */
+export const toolBySlug = (slug: string | undefined): AnyTool | undefined => bySlug.get(slug ?? "")

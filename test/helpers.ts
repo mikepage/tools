@@ -1,7 +1,7 @@
-// Runs the Worker inside workerd for tests, through Wrangler's test harness:
-// the same runtime and bundler as production, no compatibility flags.
-// `startWorker()` serves every tool; `startWorker({ module, export })` serves
-// one tool on its own.
+// Runs Workers inside workerd for tests, through Wrangler's test harness.
+// `startWorker()` serves the built Void app from dist/ssr (test/build.ts
+// builds it); `startWorker({ module, export })` serves one tool on its own,
+// behind `makeHandler`.
 
 import { mkdirSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
@@ -21,7 +21,7 @@ export interface TestWorker {
 }
 
 export const startWorker = async (tool?: { readonly module: string; readonly export: string }): Promise<TestWorker> => {
-  let configPath = join(ROOT, "wrangler.test.jsonc")
+  let configPath = join(ROOT, "dist/ssr/wrangler.json")
   if (tool) {
     mkdirSync(OUT, { recursive: true })
     const entry = join(OUT, `${tool.export}.entry.ts`)

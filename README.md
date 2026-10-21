@@ -1,22 +1,25 @@
 # tools
 
-Network and email tools at [tools.mikepage.nl](https://tools.mikepage.nl):
+Network and email tools at [tools.mikepage.workers.dev](https://tools.mikepage.workers.dev):
 DNS lookup and discovery, DMARC, SPF, RDAP, an SMTP submission test, IPv6,
 browser and IP info, Cloudflare edge and a link scanner.
 
-One Cloudflare Worker. Every tool is a server-rendered page and a JSON API.
-No framework, no runtime dependencies, no compatibility flags. The web
-platform is the standard library.
+One Cloudflare Worker, built and deployed with [Void](https://void.cloud).
+Every tool is a server-rendered page and a JSON API. The tools themselves
+use the web platform and nothing else; Void adds the file-based routes, the
+build and the deploy.
 
 ## Why
 
 These tools started on Deno, moved to Hono (191 packages and
 `nodejs_compat`), then to Effect (one package, but not built or tested for
-workerd). This version uses what the Workers runtime already has:
+workerd), then to the bare Workers runtime with no packages at all. They now
+run on Void, the Vite-based framework from VoidZero, which joined Cloudflare
+in June. The tools still use what the Workers runtime already has:
 
 | Need | Platform API |
 | --- | --- |
-| Routing | `URLPattern` |
+| Routing | Void's `routes/`, one file per URL |
 | HTTP calls with timeouts | `fetch`, `AbortSignal.timeout` |
 | DNS | DNS over HTTPS, which is `fetch` |
 | HTML parsing | `HTMLRewriter` |
@@ -25,8 +28,8 @@ workerd). This version uses what the Workers runtime already has:
 | Formatting | `Intl` |
 | Caching, rate limiting | the Cache API, the rate limiting binding |
 
-The Worker is 50 KB gzipped and starts in about 14 ms of CPU. The Effect
-version was 178 KB and about 46 ms.
+The Worker is about 68 KB gzipped. The bare Workers version was 50 KB, the
+Effect version 178 KB.
 
 What the platform doesn't have is small enough to write: input validation
 ([`src/lib/params.ts`](src/lib/params.ts)), a JSX runtime that renders HTML
@@ -36,14 +39,17 @@ classes.
 ## How it's built
 
 ```
+routes/          one Void route per URL: /, /styles.css, /api.json,
+                 /[slug], /[slug]/api, and a catch-all 404
+middleware/      the rate limit on tool runs
 src/
-  tools/     one file per tool: parse, run, and Form and Result views
-  app/       routing, the page layout, components, the stylesheet
-  lib/       shared pieces: DNS over HTTPS, fetch with timeouts, input
-  jsx/       a JSX runtime that renders to HTML strings
-  worker.ts  the Worker entry
-cli/         the `tools` command line
-test/        tests, run inside workerd
+  tools/         one file per tool: parse, run, and Form and Result views
+  app/           responses, the page layout, components, the stylesheet
+  lib/           shared pieces: DNS over HTTPS, fetch with timeouts, input
+  jsx/           a JSX runtime that renders to HTML strings
+cli/             the `tools` command line
+test/            tests, run inside workerd
+void.config.ts   the Worker's name, rate limit and custom domain
 ```
 
 A tool is a value of type `Tool` ([`src/tools/Tool.ts`](src/tools/Tool.ts)):
@@ -61,31 +67,31 @@ There is no client-side JavaScript.
 
 ## Command line
 
-`cli/tools.ts` is built with UnJS [citty](https://github.com/unjs/citty) and
-[consola](https://github.com/unjs/consola). They are the only dependencies,
-and they never reach the Worker. The CLI reads `/api.json` and calls the
-API:
+`cli/tools.ts` runs on Node alone: `parseArgs` from `node:util` for the
+arguments, the console for output. It has no dependencies. It reads
+`/api.json` and calls the API:
 
 ```sh
 npm run cli                                   # list the tools
 npm run cli -- dns-lookup cloudflare.com --type MX
 npm run cli -- dmarc-validator google.com --json
-TOOLS_URL=http://localhost:8787 npm run cli -- ip-info
+TOOLS_URL=http://localhost:5173 npm run cli -- ip-info
 ```
 
 ## Development
 
 ```sh
 npm install
-npm run dev      # wrangler dev on http://localhost:8787
-npm test         # vitest, with the Worker running in workerd
+npm run dev      # vite dev with Void on http://localhost:5173
+npm test         # builds the app, then vitest with the Worker in workerd
 npm run check    # tsc
-npm run deploy
+npm run deploy   # void deploy
 ```
 
-Tests start the Worker with Wrangler's test harness, inside workerd, the
-runtime it runs on in production. They use live resolvers, registries and
-mail servers.
+Tests build the app with Vite first, then start the built Worker with
+Wrangler's test harness, inside workerd, the runtime it runs on in
+production. The per-tool tests serve one tool on its own. They use live
+resolvers, registries and mail servers.
 
 ## License
 

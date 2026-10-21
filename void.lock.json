@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "source": {
+    "name": "tools",
+    "ratelimits": [
+      {
+        "name": "RATE_LIMIT",
+        "namespace_id": "1004",
+        "simple": {
+          "limit": 60,
+          "period": 60
+        }
+      }
+    ],
+    "routes": [
+      {
+        "pattern": "tools.mikepage.nl",
+        "custom_domain": true
+      }
+    ],
+    "workers_dev": true,
+    "preview_urls": false,
+    "observability": {
+      "enabled": true
+    }
+  },
+  "resolved": {
+    "name": "tools",
+    "ratelimits": [
+      {
+        "name": "RATE_LIMIT",
+        "namespace_id": "1004",
+        "simple": {
+          "limit": 60,
+          "period": 60
+        }
+      }
+    ],
+    "routes": [
+      {
+        "pattern": "tools.mikepage.nl",
+        "custom_domain": true
+      }
+    ],
+    "observability": {
+      "enabled": true
+    },
+    "account_id": "eee4e88ce8e7906927dbf3b285a9cf92",
+    "workers_dev": true,
+    "preview_urls": false
+  },
+  "text": "{\n  \"name\": \"tools\",\n  \"ratelimits\": [\n    {\n      \"name\": \"RATE_LIMIT\",\n      \"namespace_id\": \"1004\",\n      \"simple\": {\n        \"limit\": 60,\n        \"period\": 60\n      }\n    }\n  ],\n  \"routes\": [\n    {\n      \"pattern\": \"tools.mikepage.nl\",\n      \"custom_domain\": true\n    }\n  ],\n  \"observability\": {\n    \"enabled\": true\n  },\n  \"account_id\": \"eee4e88ce8e7906927dbf3b285a9cf92\",\n  \"workers_dev\": true,\n  \"preview_urls\": false\n}\n"
+}

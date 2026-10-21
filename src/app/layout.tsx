@@ -31,7 +31,7 @@ export const Layout = (props: {
             <main class="wrap">{props.children}</main>
             <footer class="site">
               <div class="wrap">
-                Effect on Cloudflare Workers. One runtime dependency, no <code>nodejs_compat</code>.
+                Void on Cloudflare Workers. The web platform, no <code>nodejs_compat</code>.
               </div>
             </footer>
           </body>
